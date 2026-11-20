@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-only
+package io.github.hongguo.mobile
+
+import android.app.Application
+import io.github.hongguo.mobile.core.AccountManager
+import io.github.hongguo.mobile.core.HongguoApiClient
+import io.github.hongguo.mobile.core.LocalStore
+import io.github.hongguo.mobile.player.ExoPlayerPool
+import io.github.hongguo.mobile.player.MediaCacheManager
+import io.github.hongguo.mobile.player.SleepTimerManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+
+class AppContainer(app: Application) {
+    val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .build()
+
+    val localStore = LocalStore(app)
+    val apiClient = HongguoApiClient(httpClient) { localStore.authSession.value }
+    val accountManager = AccountManager(httpClient, localStore, apiClient)
+    val mediaCache = MediaCacheManager(app, apiClient, httpClient)
+    val playerPool = ExoPlayerPool()
+    val sleepTimer = SleepTimerManager()
+    val isInPipMode = MutableStateFlow(false)
+
+    init {
+        accountManager.verifySessionHealthAsync()
+    }
+}
+
+class HongguoApp : Application() {
+    lateinit var container: AppContainer
+        private set
+
+    override fun onCreate() {
+        super.onCreate()
+        container = AppContainer(this)
+    }
+}

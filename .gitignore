@@ -1,0 +1,29 @@
+# Gradle & Kotlin
+.gradle/
+.kotlin/
+build/
+app/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Local IDE / SDK / OS
+local.properties
+.idea/
+*.iml
+.cxx/
+.externalNativeBuild/
+captures/
+.DS_Store
+Thumbs.db
+
+# Local binaries & signing keys
+短剧播放器.exe
+*.exe
+*.jks
+*.keystore
+
+# Logs & temp files
+*.log
+*.tmp

@@ -1,0 +1,12 @@
+# Keep kotlinx.serialization, core models, Media3 & okhttp rules
+-keepattributes *Annotation*, Signature, InnerClasses, EnclosingMethod
+-keep class io.github.hongguo.mobile.core.** { *; }
+-keepclassmembers class kotlinx.serialization.json.** { *; }
+-keep class androidx.media3.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
+-dontwarn javax.annotation.**
+-dontwarn java.lang.invoke.**
