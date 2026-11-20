@@ -17,8 +17,8 @@ import java.util.concurrent.TimeUnit
 class DeviceRegistrar(private val httpClient: OkHttpClient) {
     companion object {
         private val REGISTER_URLS = listOf(
-            "https://log5-applog-lf.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1",
             "https://log5-applog-lq.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1",
+            "https://log5-applog-lf.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1",
             "https://log5-applog-hl.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1"
         )
         private val KDF_SALT = ByteHelpers.hexToBytes(

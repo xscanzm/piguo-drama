@@ -55,7 +55,7 @@
 ## 下载与安装
 
 - **系统要求**：Android 8.0 及以上手机
-- **下载方式**：打开 [Releases 发布页](https://github.com/xscanzm/piguo-drama/releases/latest) → 下载 `piguo-drama-v1.0.0.apk`（文件名 `app-release.apk`，仅约 `3.6 MB`）安装即可使用。
+- **下载方式**：打开 [Releases 发布页](https://github.com/xscanzm/piguo-drama/releases/latest) → 下载 `piguo-drama-v1.0.1.apk`（文件名 `app-release.apk`，仅约 `3.6 MB`）安装即可使用。
 
 ---
 
@@ -64,8 +64,8 @@
 想加什么实用小功能、遇到哪些片源或适配问题，或者想一起交流真正值得追的 **S 级宝藏短剧**，欢迎扫码进群直接告诉我们！
 
 <div align="center">
-  <img src="docs/images/wechat-group-qr.jpg" width="260" alt="皮果短剧微信交流群二维码" />
-  <p><em>微信扫一扫加入「皮果短剧」交流群（二维码 7 天内即 11 月 27 日前有效，如过期可在 <a href="https://github.com/xscanzm/piguo-drama/issues">Issues</a> 留言更新）</em></p>
+  <img src="docs/images/wechat-group-qr.png" width="260" alt="边coding边看剧微信交流群二维码" />
+  <p><em>微信扫一扫加入「边coding边看剧」交流群（二维码 7 天内即 11 月 27 日前有效，如过期可在 <a href="https://github.com/xscanzm/piguo-drama/issues">Issues</a> 留言更新）</em></p>
 </div>
 
 ---

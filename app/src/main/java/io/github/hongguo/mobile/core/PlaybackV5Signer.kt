@@ -429,9 +429,10 @@ object PlaybackV5Signer {
         return ByteHelpers.base64Encode(ByteHelpers.concat(nonce, output))
     }
 
-    fun sign(baseUrl: String, values: Map<String, String>, gzipBody: ByteArray, nowMs: Long = System.currentTimeMillis()): SignedRequest {
+    fun sign(baseUrl: String, values: Map<String, String>, gzipBody: ByteArray?, nowMs: Long = System.currentTimeMillis()): SignedRequest {
         val ts = (nowMs / 1000L).toInt()
-        val bodyHash = ByteHelpers.md5(gzipBody)
+        val hasBody = gzipBody != null
+        val bodyHash = ByteHelpers.md5(gzipBody ?: ByteArray(0))
         for (offset in 0 until 1024) {
             val ticket = (nowMs + offset).toString()
             val ordered = values.toMutableMap()
@@ -440,15 +441,17 @@ object PlaybackV5Signer {
             val queryHash = Sm3.digest(query.toByteArray(StandardCharsets.UTF_8))
             if (branch(queryHash, bodyHash, ts) != 12) continue
             val f13 = hashF13(queryHash, bodyHash, ts)
+            val headers = LinkedHashMap<String, String>(4).apply {
+                put("x-khronos", ts.toString())
+                put("x-helios", helios(ts))
+                put("x-medusa", medusa(queryHash, f13, ts, values))
+                if (hasBody) {
+                    put("x-ss-stub", ByteHelpers.bytesToHex(bodyHash, uppercase = true))
+                }
+            }
             return SignedRequest(
                 url = "$baseUrl?$query",
-                headers = mapOf(
-                    "x-khronos" to ts.toString(),
-                    "x-helios" to helios(ts),
-                    "x-medusa" to medusa(queryHash, f13, ts, values),
-                    "x-ss-stub" to ByteHelpers.bytesToHex(bodyHash, uppercase = true),
-                    "x-ss-req-ticket" to ticket
-                )
+                headers = headers
             )
         }
         error("Unable to select V5 playback signature branch within 1024 tickets")

@@ -35,6 +35,15 @@ object LegacySigner {
         "api5-normal-lq.fqnovel.com"
     )
 
+    val VIDEO_TAB_HOSTS = listOf(
+        "api5-normal-sinfonlinec.fqnovel.com",
+        "api5-normal-lq.fqnovel.com",
+        "api3-normal-lf.fqnovel.com",
+        "api3-normal-lq.fqnovel.com",
+        "api5-normal-sinfonlineb.fqnovel.com",
+        "api5-normal-sinfonlinea.fqnovel.com"
+    )
+
     val PASSPORT_HOSTS = listOf(
         "security.snssdk.com",
         "is.snssdk.com",
@@ -1047,6 +1056,50 @@ object LegacySigner {
             }
         }
         return MetadataSignedRequest(signed.url, headers, gzipBody)
+    }
+
+    fun buildV5VideoTabRequest(
+        vid: String,
+        identity: DeviceIdentity,
+        hostOverride: String = VIDEO_TAB_HOSTS.first(),
+        cookieHeader: String? = null
+    ): MetadataSignedRequest {
+        val base = "https://$hostOverride/reading/bookapi/video_tab/multi_video_model/v1/"
+        val signed = PlaybackV5Signer.sign(
+            baseUrl = base,
+            values = linkedMapOf(
+                "aid" to "8662",
+                "app_name" to "novelread",
+                "version_code" to "74332",
+                "version_name" to "7.4.3.32",
+                "channel" to "vivo_8662_64",
+                "device_platform" to "android",
+                "device_type" to "PGT-AN10",
+                "os_version" to "12",
+                "update_version_code" to "74332",
+                "iid" to identity.iid,
+                "cdid" to identity.cdid,
+                "device_id" to identity.deviceId,
+                "video_id" to vid,
+                "video_id_type" to "0",
+                "device_level" to "1",
+                "need_all_video_definition" to "1",
+                "need_mp4_align" to "0",
+                "use_os_player" to "0",
+                "video_platform" to "1024",
+                "source" to "0",
+                "from_video_id" to ""
+            ),
+            gzipBody = null
+        )
+        val headers = LinkedHashMap(signed.headers).apply {
+            this["User-Agent"] = VIDEO_UA.replace("71332", "73932")
+            this["Accept"] = "application/json"
+            if (!cookieHeader.isNullOrBlank()) {
+                this["Cookie"] = cookieHeader
+            }
+        }
+        return MetadataSignedRequest(signed.url, headers, null)
     }
 
     fun buildLegacyPlaybackRequest(

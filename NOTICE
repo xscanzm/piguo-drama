@@ -204,3 +204,6 @@ signing-v5-carrier.json。保留上游 drpys 22261adfa31435e3b3ef5a730b8a2a75bca
   3. 推荐流质量筛选、选集「高能集」标注、画中画（PiP）、防误触锁屏、定时关闭与
      后台/息屏听剧等功能；
   4. 应用品牌重塑为「皮果刷剧」，保持完整 GPL-3.0-only 开源授权与上游归属说明。
+  5. `video_tab` 无正文 V5 GET 播放恢复协议改编自上游 GPL-3.0-only 公开实现
+     （`jackotom/hongguo-drama` 提交 `92df757e`、`N3urda/hongguoTV` 提交
+     `478f0068` 及 `ch6vip/novel-sound`），并按有效节点域名优先级回退。

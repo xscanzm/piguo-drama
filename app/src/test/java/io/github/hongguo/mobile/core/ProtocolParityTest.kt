@@ -54,7 +54,7 @@ class ProtocolParityTest {
             nowMs = 1700000000000L
         )
         assertEquals("1700000000", signed.headers["x-khronos"])
-        assertEquals("1700000000003", signed.headers["x-ss-req-ticket"])
+        assertNull(signed.headers["x-ss-req-ticket"])
         assertEquals("654AE4E85BFDF40203C28E3971496134", signed.headers["x-ss-stub"])
         assertTrue(signed.url.endsWith("&_rticket=1700000000003"))
         assertEquals(36, ByteHelpers.base64Decode(signed.headers.getValue("x-helios")).size)
@@ -247,5 +247,24 @@ class ProtocolParityTest {
         )
         assertTrue(fallbackReq.url.contains("/novel/player/multi_video_model/player/v1?"))
         assertTrue(!fallbackReq.headers["x-medusa"].isNullOrEmpty())
+    }
+
+    @Test
+    fun v5VideoTabGetOmitsBodyHeadersAndUsesEmptyBodyDigest() {
+        val identity = DeviceIdentity("9876543210", "1234567890", "11111111-1111-4111-8111-111111111111")
+        val req = LegacySigner.buildV5VideoTabRequest(vid = "7680666554572229656", identity = identity)
+
+        assertTrue(req.url.contains("https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/?"))
+        assertTrue(req.url.contains("video_id=7680666554572229656"))
+        assertNull(req.body)
+        assertTrue(!req.headers["x-khronos"].isNullOrEmpty())
+        assertTrue(!req.headers["x-helios"].isNullOrEmpty())
+        assertTrue(!req.headers["x-medusa"].isNullOrEmpty())
+        assertTrue(!req.headers["User-Agent"].isNullOrEmpty())
+        assertTrue(!req.headers["Accept"].isNullOrEmpty())
+        assertNull(req.headers["x-ss-stub"])
+        assertNull(req.headers["x-ss-req-ticket"])
+        assertNull(req.headers["Content-Type"])
+        assertNull(req.headers["Content-Encoding"])
     }
 }
