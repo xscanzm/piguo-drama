@@ -74,6 +74,7 @@ fun ProfileScreen(container: AppContainer) {
     val settings by container.localStore.settings.collectAsState()
     val authSession by container.localStore.authSession.collectAsState()
     val feedPrefs by container.localStore.feedPreferences.collectAsState()
+    val seenFeedCount by container.localStore.seenFeedCount.collectAsState()
     val syncing by container.accountManager.syncing.collectAsState()
     val sessionExpired by container.accountManager.sessionExpired.collectAsState()
     var cacheBytes by remember { mutableLongStateOf(0L) }
@@ -449,7 +450,8 @@ fun ProfileScreen(container: AppContainer) {
             }
         }
 
-        if (feedPrefs.dislikedSeriesIds.isNotEmpty() || feedPrefs.dislikedTags.isNotEmpty()) {
+        val hasDislikes = feedPrefs.dislikedSeriesIds.isNotEmpty() || feedPrefs.dislikedTags.isNotEmpty()
+        if (hasDislikes || seenFeedCount > 0) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -457,24 +459,51 @@ fun ProfileScreen(container: AppContainer) {
                     .background(SurfaceDark)
                     .padding(14.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("推荐过滤记录", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(4.dp))
+                Text("推荐过滤记录", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                if (hasDislikes) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text(
                             "已屏蔽 ${feedPrefs.dislikedSeriesIds.size} 部剧集 · ${feedPrefs.dislikedTags.size} 个题材",
                             color = TextSecondary,
-                            fontSize = 12.sp
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
                         )
+                        Button(
+                            onClick = {
+                                container.localStore.clearDislikes()
+                                container.apiClient.clearDislikedRecFilters()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = SurfaceElevated)
+                        ) {
+                            Text("重置", color = TextPrimary)
+                        }
                     }
-                    Button(
-                        onClick = { container.localStore.clearDislikes() },
-                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceElevated)
+                }
+                if (seenFeedCount > 0) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("重置", color = TextPrimary)
+                        Text(
+                            "已刷去重 $seenFeedCount 部剧集",
+                            color = TextSecondary,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = {
+                                container.localStore.clearSeenFeed()
+                                container.apiClient.clearSeenRecFilters()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = SurfaceElevated)
+                        ) {
+                            Text("清空已刷", color = TextPrimary)
+                        }
                     }
                 }
                 if (feedPrefs.dislikedTags.isNotEmpty()) {

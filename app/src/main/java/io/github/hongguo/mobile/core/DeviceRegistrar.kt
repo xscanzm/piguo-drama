@@ -4,17 +4,23 @@ package io.github.hongguo.mobile.core
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-class DeviceRegistrar(private val httpClient: OkHttpClient) {
+class DeviceRegistrar(
+    private val httpClient: OkHttpClient,
+    private val identityFile: File? = null
+) {
     companion object {
         private val REGISTER_URLS = listOf(
             "https://log5-applog-lq.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1",
@@ -30,8 +36,41 @@ class DeviceRegistrar(private val httpClient: OkHttpClient) {
     }
 
     private val mutex = Mutex()
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private var cachedIdentity: DeviceIdentity? = null
     private var retryAfterMs = 0L
+
+    init {
+        val sourceFile = identityFile
+        if (sourceFile != null && sourceFile.exists()) {
+            runCatching {
+                val loaded = json.decodeFromString<DeviceIdentity>(
+                    sourceFile.readText(StandardCharsets.UTF_8)
+                )
+                if (isValidId(loaded.deviceId) && isValidId(loaded.iid) && loaded.cdid.isNotBlank()) {
+                    cachedIdentity = loaded
+                }
+            }
+        }
+    }
+
+    private fun isValidId(str: String): Boolean {
+        val trimmed = str.trim()
+        return Regex("^\\d{1,30}$").matches(trimmed) && trimmed.any { it in '1'..'9' }
+    }
+
+    private fun persistIdentity(identity: DeviceIdentity) {
+        val target = identityFile ?: return
+        runCatching {
+            target.parentFile?.mkdirs()
+            val tmp = File(target.parentFile, "${target.name}.tmp")
+            tmp.writeText(json.encodeToString(identity), StandardCharsets.UTF_8)
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        }
+    }
 
     private fun responseId(obj: JSONObject, name: String): String {
         val preferred = obj.opt("${name}_str")
@@ -40,7 +79,7 @@ class DeviceRegistrar(private val httpClient: OkHttpClient) {
         } else preferred
         if (value == null || value == JSONObject.NULL) return ""
         val str = value.toString().trim()
-        return if (Regex("^\\d{1,30}$").matches(str) && str.any { it in '1'..'9' }) str else ""
+        return if (isValidId(str)) str else ""
     }
 
     suspend fun getOrRegister(
@@ -57,6 +96,7 @@ class DeviceRegistrar(private val httpClient: OkHttpClient) {
         val identity = registerInternal()
         cachedIdentity = identity
         retryAfterMs = 0L
+        persistIdentity(identity)
         return identity
     }
 

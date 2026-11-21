@@ -158,6 +158,8 @@ fun VerticalDramaPlayer(
     val latestBackgroundAudio by rememberUpdatedState(backgroundAudioPlay)
     val latestInPip by rememberUpdatedState(isInPipMode)
     val latestOnVideoAspect by rememberUpdatedState(onVideoAspectKnown)
+    val latestOnEnded by rememberUpdatedState(onEnded)
+    val latestOnProgressUpdate by rememberUpdatedState(onProgressUpdate)
 
     LaunchedEffect(lockHintVisible, isScreenLocked) {
         if (lockHintVisible && isScreenLocked) {
@@ -265,9 +267,10 @@ fun VerticalDramaPlayer(
                 if (playbackState == Player.STATE_READY) {
                     durationMs = exoPlayer.duration.coerceAtLeast(0L)
                 } else if (playbackState == Player.STATE_ENDED) {
-                    onProgressUpdate(exoPlayer.duration.coerceAtLeast(0L), exoPlayer.duration.coerceAtLeast(0L))
+                    val endedDur = exoPlayer.duration.coerceAtLeast(0L)
+                    latestOnProgressUpdate(endedDur, endedDur)
                     latestFlushProgress()
-                    onEnded()
+                    latestOnEnded()
                 }
             }
 
@@ -325,7 +328,7 @@ fun VerticalDramaPlayer(
                 val dur = exoPlayer.duration
                 if (dur > 0L) durationMs = dur
                 if (++ticks % 4 == 0 && currentPosMs > 0L) {
-                    onProgressUpdate(currentPosMs, durationMs)
+                    latestOnProgressUpdate(currentPosMs, durationMs)
                 }
             }
             delay(250L)

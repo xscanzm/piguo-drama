@@ -10,6 +10,7 @@ import io.github.hongguo.mobile.player.MediaCacheManager
 import io.github.hongguo.mobile.player.SleepTimerManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import okhttp3.OkHttpClient
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 class AppContainer(app: Application) {
@@ -20,7 +21,11 @@ class AppContainer(app: Application) {
         .build()
 
     val localStore = LocalStore(app)
-    val apiClient = HongguoApiClient(httpClient) { localStore.authSession.value }
+    val apiClient = HongguoApiClient(
+        httpClient = httpClient,
+        ratingCacheFile = File(app.filesDir, "hongguo_store/official_ratings.json"),
+        deviceIdentityFile = File(app.filesDir, "hongguo_store/device_identity.json")
+    ) { localStore.authSession.value }
     val accountManager = AccountManager(httpClient, localStore, apiClient)
     val mediaCache = MediaCacheManager(app, apiClient, httpClient)
     val playerPool = ExoPlayerPool()
@@ -28,6 +33,10 @@ class AppContainer(app: Application) {
     val isInPipMode = MutableStateFlow(false)
 
     init {
+        apiClient.seedRecFilters(
+            seen = localStore.recentSeenRecFilters(30),
+            disliked = localStore.feedPreferences.value.dislikedRecFilters
+        )
         accountManager.verifySessionHealthAsync()
     }
 }

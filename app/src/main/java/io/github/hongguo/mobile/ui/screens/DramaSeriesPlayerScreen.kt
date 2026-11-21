@@ -65,7 +65,9 @@ import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.shouldRecordWatchHistory
 import io.github.hongguo.mobile.player.ResolvedMediaSource
+import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.components.DarkHorseBadge
 import io.github.hongguo.mobile.ui.components.DramaQualityBadge
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
@@ -278,21 +280,24 @@ fun DramaSeriesPlayerScreen(
                         if (ep.index == initialEpisodeIndex) usedInitialPos = true
                         if (qualityResumePos?.first == page) qualityResumePos = null
                         livePositions[ep.index] = pos
-                        container.localStore.recordWatchProgress(
-                            seriesId = loadedDetail.seriesId,
-                            title = loadedDetail.title,
-                            cover = loadedDetail.cover,
-                            totalEpisodes = loadedDetail.episodes.size,
-                            episodeIndex = ep.index,
-                            positionMs = pos,
-                            durationMs = dur
-                        )
-                        container.accountManager.reportWatchProgressAsync(
-                            seriesId = loadedDetail.seriesId,
-                            vid = ep.vid,
-                            episodeIndex = ep.index,
-                            positionMs = pos
-                        )
+                        val alreadyInHistory = container.localStore.getLastWatchEntry(loadedDetail.seriesId) != null
+                        if (shouldRecordWatchHistory(ep.index, pos, alreadyInHistory)) {
+                            container.localStore.recordWatchProgress(
+                                seriesId = loadedDetail.seriesId,
+                                title = loadedDetail.title,
+                                cover = loadedDetail.cover,
+                                totalEpisodes = loadedDetail.episodes.size,
+                                episodeIndex = ep.index,
+                                positionMs = pos,
+                                durationMs = dur
+                            )
+                            container.accountManager.reportWatchProgressAsync(
+                                seriesId = loadedDetail.seriesId,
+                                vid = ep.vid,
+                                episodeIndex = ep.index,
+                                positionMs = pos
+                            )
+                        }
                     },
                     onLongPressSpeedChange = { longPressActive = it },
                     isFullscreen = isFullscreen,
@@ -439,6 +444,14 @@ fun DramaSeriesPlayerScreen(
                                     )
                                 }
                             }
+                            Spacer(Modifier.height(6.dp))
+                        }
+                        if (loadedDetail.displayTags.isNotEmpty()) {
+                            CategoryTagChips(
+                                tags = loadedDetail.displayTags,
+                                gender = loadedDetail.gender,
+                                isNew = (loadedDetail.quality?.ageDays ?: -1) in 0..7
+                            )
                             Spacer(Modifier.height(6.dp))
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -611,6 +624,8 @@ fun DramaSeriesPlayerScreen(
             currentEpisodeIndex = curEp?.index,
             currentEpisodeDigg = curEp?.diggCount,
             episodeDiggs = loadedDetail.episodes.map { it.diggCount },
+            tags = loadedDetail.categoryNames,
+            episodeComments = loadedDetail.episodes.map { it.commentCount },
             onDismiss = { showQualitySheet = false }
         )
     }

@@ -24,6 +24,8 @@ import java.util.concurrent.TimeUnit
 
 class HongguoApiClient(
     val httpClient: OkHttpClient,
+    private val ratingCacheFile: java.io.File? = null,
+    private val deviceIdentityFile: java.io.File? = null,
     private val authSessionProvider: () -> AuthSession? = { null }
 ) {
     companion object {
@@ -59,7 +61,8 @@ class HongguoApiClient(
         private val WEB_MEDIA_DOMAINS = listOf("hongguoduanju.com", "qznovelvod.com", "fqnovelvod.com", "douyinvod.com")
     }
 
-    val registrar = DeviceRegistrar(httpClient)
+    val registrar = DeviceRegistrar(httpClient, deviceIdentityFile)
+    val ratingCache = OfficialRatingCache(ratingCacheFile)
     private val playbackMutex = Mutex()
     private var playbackReadyAtMs = 0L
     private val detailThrottleMutex = Mutex()
@@ -71,6 +74,7 @@ class HongguoApiClient(
     private val recommendCursors = ConcurrentHashMap<String, MutableMap<Int, CursorState>>()
     private val mallFeedCursors = ConcurrentHashMap<String, MutableMap<Int, CursorState>>()
     private val seenRecFilters = ConcurrentHashMap<String, LinkedHashSet<String>>()
+    private val persistedSeenRecFilters = java.util.Collections.synchronizedList(ArrayList<String>())
     private val dislikedRecFilters = java.util.Collections.synchronizedList(ArrayList<String>())
     private val prefetchedVariantsCache = ConcurrentHashMap<String, Pair<Long, List<PlayVariant>>>()
     private val catalogGenres = ConcurrentHashMap<String, List<GenreItem>>()
@@ -287,26 +291,117 @@ class HongguoApiClient(
         }
     }
 
-    private fun buildRecFilterListJson(channelKey: String): String {
-        val list = JSONArray()
-        val dedup = LinkedHashSet<String>()
-        synchronized(dislikedRecFilters) {
-            for (raw in dislikedRecFilters.takeLast(30)) {
-                if (dedup.add(raw)) {
-                    runCatching { JSONObject(raw) }.getOrNull()?.let { list.put(it) }
+    fun seedRecFilters(seen: List<String>, disliked: List<String>) {
+        synchronized(persistedSeenRecFilters) {
+            persistedSeenRecFilters.clear()
+            val dedup = HashSet<String>()
+            for (raw in seen) {
+                val clean = raw.trim()
+                if (clean.isNotEmpty() && dedup.add(clean)) {
+                    persistedSeenRecFilters.add(clean)
+                    if (persistedSeenRecFilters.size >= 60) break
                 }
             }
         }
-        val seen = seenRecFilters[channelKey]
-        if (seen != null) {
-            synchronized(seen) {
-                for (raw in seen.toList().takeLast(30)) {
-                    if (dedup.add(raw)) {
-                        runCatching { JSONObject(raw) }.getOrNull()?.let { list.put(it) }
+        synchronized(dislikedRecFilters) {
+            for (raw in disliked.asReversed()) {
+                val clean = raw.trim()
+                if (clean.isNotEmpty()) {
+                    dislikedRecFilters.remove(clean)
+                    dislikedRecFilters.add(clean)
+                    while (dislikedRecFilters.size > 80) {
+                        dislikedRecFilters.removeAt(0)
                     }
                 }
             }
         }
+    }
+
+    fun recordSeenRecFilter(channelKey: String, recFilterInfo: String) {
+        val clean = recFilterInfo.trim()
+        if (clean.isEmpty()) return
+        val channelSet = seenRecFilters.getOrPut(channelKey) { LinkedHashSet() }
+        synchronized(channelSet) {
+            channelSet.remove(clean)
+            channelSet.add(clean)
+            while (channelSet.size > 60) {
+                channelSet.iterator().let { it.next(); it.remove() }
+            }
+        }
+        synchronized(persistedSeenRecFilters) {
+            persistedSeenRecFilters.remove(clean)
+            persistedSeenRecFilters.add(0, clean)
+            while (persistedSeenRecFilters.size > 60) {
+                persistedSeenRecFilters.removeAt(persistedSeenRecFilters.lastIndex)
+            }
+        }
+    }
+
+    fun removeDislikedRecFilter(recFilterInfo: String) {
+        val clean = recFilterInfo.trim()
+        if (clean.isEmpty()) return
+        synchronized(dislikedRecFilters) {
+            dislikedRecFilters.remove(clean)
+        }
+    }
+
+    fun clearSeenRecFilters() {
+        seenRecFilters.clear()
+        synchronized(persistedSeenRecFilters) {
+            persistedSeenRecFilters.clear()
+        }
+    }
+
+    fun clearDislikedRecFilters() {
+        synchronized(dislikedRecFilters) {
+            dislikedRecFilters.clear()
+        }
+    }
+
+    internal fun buildRecFilterListJson(
+        channelKey: String,
+        maxItems: Int = 30,
+        maxRawChars: Int = 3500
+    ): String {
+        if (maxItems <= 0 || maxRawChars < 2) return ""
+        val list = JSONArray()
+        val dedup = LinkedHashSet<String>()
+        var charCount = 2
+
+        fun tryAdd(raw: String): Boolean {
+            if (list.length() >= maxItems) return false
+            val clean = raw.trim()
+            if (clean.isEmpty() || !dedup.add(clean)) return true
+            val obj = runCatching { JSONObject(clean) }.getOrNull() ?: return true
+            val serialized = obj.toString()
+            val addedLen = serialized.length + if (list.length() > 0) 1 else 0
+            if (charCount + addedLen > maxRawChars) return false
+            list.put(obj)
+            charCount += addedLen
+            return list.length() < maxItems
+        }
+
+        val dislikedSnapshot = synchronized(dislikedRecFilters) {
+            dislikedRecFilters.asReversed().take(12)
+        }
+        for (raw in dislikedSnapshot) {
+            if (!tryAdd(raw)) break
+        }
+
+        val channelSnapshot = seenRecFilters[channelKey]?.let { seen ->
+            synchronized(seen) { seen.toList().asReversed() }
+        }.orEmpty()
+        for (raw in channelSnapshot) {
+            if (!tryAdd(raw)) break
+        }
+
+        val persistedSnapshot = synchronized(persistedSeenRecFilters) {
+            persistedSeenRecFilters.toList()
+        }
+        for (raw in persistedSnapshot) {
+            if (!tryAdd(raw)) break
+        }
+
         return if (list.length() > 0) list.toString() else ""
     }
 
@@ -410,6 +505,7 @@ class HongguoApiClient(
         } else {
             cursors.remove(page + 1)
         }
+        ratingCache.saveIfDirty()
 
         return CatalogPageResult(
             items = items,
@@ -490,28 +586,71 @@ class HongguoApiClient(
 
         val followedCnt = det?.optLong("followed_cnt", 0L)?.coerceAtLeast(0L) ?: 0L
         val seriesPlayCnt = det?.optLong("series_play_cnt", 0L)?.coerceAtLeast(0L) ?: 0L
+        val vCatRaw = v.opt("category_schema")?.takeIf { it != JSONObject.NULL && it.toString().trim().startsWith("[") }
+        val detCatRaw = det?.opt("category_schema")?.takeIf { it != JSONObject.NULL && it.toString().trim().startsWith("[") }
+        val categoryNames = DramaTagger.parseCategoryNames(vCatRaw ?: detCatRaw)
+        val displayTags = DramaTagger.pickDisplayTags(categoryNames)
+        val parsedGender = DramaTagger.parseGender(vCatRaw).let { g ->
+            if (g >= 0) g else DramaTagger.parseGender(detCatRaw)
+        }
+        val officialRating = DramaTagger.parseOfficialRating(v)
+        val platformScore = DramaTagger.parsePlatformScore(v)
+        if (officialRating != null || platformScore != null || parsedGender >= 0) {
+            ratingCache.put(sid, officialRating, platformScore, parsedGender)
+        }
+        val cachedRating = ratingCache.get(sid)
+        val gender = if (parsedGender >= 0) parsedGender else (cachedRating?.gender ?: -1)
+        val createTimeSec = v.optLong("create_time", 0L).let {
+            if (it > 0L) it else (det?.optLong("create_time", 0L) ?: 0L)
+        }.coerceAtLeast(0L)
+        val isCompleted = parseCompletedStatus(epLabel)
+        val nowSec = System.currentTimeMillis() / 1000L
+        val isNewTag = DramaTagger.parseNewTag(v) || (createTimeSec > 0L && (nowSec - createTimeSec) in 0L..(7L * 86400L))
         var parsedQuality: DramaQualityReport? = null
+        var initialEpisodeIndex = 1
 
         // Warm detail cache immediately when video_detail.video_list is embedded
         val detVideos = det?.optJSONArray("video_list")
         if (detVideos != null && detVideos.length() > 0) {
-            val rawEps = ArrayList<Pair<Int, EpisodeItem>>(detVideos.length())
+            val rawEps = ArrayList<Triple<Int, Boolean, EpisodeItem>>(detVideos.length())
             for (k in 0 until detVideos.length()) {
                 val epObj = detVideos.optJSONObject(k) ?: continue
                 val ev = epObj.optString("vid", "").trim()
                 if (!Regex("^\\d{1,30}$").matches(ev)) continue
                 val eIdx = epObj.optInt("vid_index", k + 1).coerceAtLeast(1)
                 val digg = epObj.optLong("digged_count", 0L).coerceAtLeast(0L)
-                rawEps.add(eIdx to EpisodeItem(vid = ev, index = eIdx, title = "第${eIdx}集", diggCount = digg))
+                val cmt = epObj.optLong("comment_count", 0L).coerceAtLeast(0L)
+                val isNewly = epObj.optBoolean("is_newly_update", false)
+                rawEps.add(
+                    Triple(
+                        eIdx,
+                        isNewly,
+                        EpisodeItem(vid = ev, index = eIdx, title = "第${eIdx}集", diggCount = digg, commentCount = cmt)
+                    )
+                )
             }
             if (rawEps.isNotEmpty()) {
-                val sortedEps = rawEps.sortedBy { it.first }.mapIndexed { idx, p ->
-                    p.second.copy(index = idx + 1, title = "第${idx + 1}集")
+                val sortedRows = rawEps.sortedBy { it.first }
+                val sortedEps = sortedRows.mapIndexed { idx, p ->
+                    p.third.copy(index = idx + 1, title = "第${idx + 1}集")
                 }
-                parsedQuality = DramaQualityEvaluator.evaluate(
+                if (vid.isNotEmpty()) {
+                    sortedEps.firstOrNull { it.vid == vid }?.index?.let { initialEpisodeIndex = it }
+                }
+                val newlyCount = sortedRows.count { it.second }
+                val resolvedEpLabel = epLabel.ifEmpty { "全${sortedEps.size}集" }
+                val resolvedCompleted = isCompleted ?: parseCompletedStatus(resolvedEpLabel)
+                parsedQuality = buildQuality(
+                    seriesId = sid,
                     episodeDiggs = sortedEps.map { it.diggCount },
+                    episodeComments = sortedEps.map { it.commentCount },
                     followedCount = followedCnt,
-                    seriesPlayCount = seriesPlayCnt
+                    seriesPlayCount = seriesPlayCnt,
+                    createTimeSec = createTimeSec,
+                    isCompleted = resolvedCompleted,
+                    newlyUpdatedCount = newlyCount,
+                    officialRating = officialRating,
+                    platformScore = platformScore
                 )
                 detailCache.putIfAbsent(
                     sid,
@@ -520,11 +659,16 @@ class HongguoApiClient(
                         title = title,
                         cover = cover,
                         description = desc,
-                        episodeLabel = epLabel.ifEmpty { "全${sortedEps.size}集" },
+                        episodeLabel = resolvedEpLabel,
                         episodes = sortedEps,
                         followedCount = followedCnt,
                         seriesPlayCount = seriesPlayCnt,
-                        quality = parsedQuality
+                        quality = parsedQuality,
+                        categoryNames = categoryNames,
+                        displayTags = displayTags,
+                        gender = gender,
+                        createTimeSec = createTimeSec,
+                        isCompleted = resolvedCompleted
                     )
                 )
             }
@@ -554,21 +698,30 @@ class HongguoApiClient(
             }
         }
 
+        val mergedTags = (categoryNames + tags).distinct()
         return DramaSummary(
             seriesId = sid,
             title = title,
             cover = cover,
             episodeCount = epCnt,
             description = desc,
-            tags = tags.take(4),
+            tags = mergedTags,
             heat = heatText,
             episodeLabel = epLabel,
             initialVid = vid,
+            initialEpisodeIndex = initialEpisodeIndex,
             recommendInfo = v.optString("recommend_info", ""),
             recFilterInfo = recFilterRaw,
             followedCount = followedCnt,
             seriesPlayCount = seriesPlayCnt,
-            quality = parsedQuality
+            quality = parsedQuality,
+            categoryNames = categoryNames,
+            displayTags = displayTags,
+            gender = gender,
+            createTimeSec = createTimeSec,
+            isNewTag = isNewTag,
+            officialRating = officialRating ?: cachedRating?.rating,
+            platformScore = platformScore ?: cachedRating?.platformScore
         )
     }
 
@@ -656,12 +809,49 @@ class HongguoApiClient(
         } else {
             cursors.remove(page + 1)
         }
+        ratingCache.saveIfDirty()
 
         return CatalogPageResult(
             items = items,
             genres = emptyList(),
             page = page,
             hasMore = hasMore && page < 50 && cursors.containsKey(page + 1)
+        )
+    }
+
+    private fun parseCompletedStatus(epLabel: String): Boolean? {
+        val trimmed = epLabel.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.startsWith("全")) return true
+        if (trimmed.contains("更新") || trimmed.contains("连载")) return false
+        return null
+    }
+
+    private fun buildQuality(
+        seriesId: String,
+        episodeDiggs: List<Long>,
+        episodeComments: List<Long>,
+        followedCount: Long,
+        seriesPlayCount: Long,
+        createTimeSec: Long,
+        isCompleted: Boolean?,
+        newlyUpdatedCount: Int,
+        officialRating: Float? = null,
+        platformScore: Float? = null
+    ): DramaQualityReport? {
+        val cached = ratingCache.get(seriesId)
+        return DramaQualityEvaluator.evaluate(
+            DramaQualityInput(
+                episodeDiggs = episodeDiggs,
+                episodeComments = episodeComments,
+                followedCount = followedCount,
+                seriesPlayCount = seriesPlayCount,
+                createTimeSec = createTimeSec,
+                isCompleted = isCompleted,
+                newlyUpdatedCount = newlyUpdatedCount,
+                officialRating = officialRating ?: cached?.rating,
+                platformScore = platformScore ?: cached?.platformScore
+            )
         )
     }
 
@@ -833,6 +1023,7 @@ class HongguoApiClient(
 
         val seen = HashSet<String>()
         val summaries = ArrayList<DramaSummary>()
+        val nowSec = System.currentTimeMillis() / 1000L
         for ((idx, v) in rows.withIndex()) {
             val id = v.optString("series_id", "").trim()
             val title = cleanTitle(
@@ -848,6 +1039,18 @@ class HongguoApiClient(
                     if (c.isNotEmpty()) tags.add(c)
                 }
             }
+            val rawCat = v.opt("category_schema")
+            val categoryNames = DramaTagger.parseCategoryNames(rawCat)
+            val displayTags = DramaTagger.pickDisplayTags(categoryNames)
+            val parsedGender = DramaTagger.parseGender(rawCat)
+            val officialRating = DramaTagger.parseOfficialRating(v)
+            val platformScore = DramaTagger.parsePlatformScore(v)
+            ratingCache.put(id, officialRating, platformScore, parsedGender)
+            val cachedRating = ratingCache.get(id)
+            val gender = if (parsedGender >= 0) parsedGender else (cachedRating?.gender ?: -1)
+            val createTimeSec = v.optLong("create_time", 0L).coerceAtLeast(0L)
+            val isNewTag = DramaTagger.parseNewTag(v) || (createTimeSec > 0L && (nowSec - createTimeSec) in 0L..(7L * 86400L))
+            val mergedTags = (categoryNames + tags).distinct()
             summaries.add(
                 DramaSummary(
                     seriesId = id,
@@ -855,8 +1058,15 @@ class HongguoApiClient(
                     cover = compatibleCover(v.optString("cover")),
                     episodeCount = v.optInt("episode_cnt", 0),
                     description = cleanTitle(v.optString("video_desc").ifEmpty { v.optString("series_intro") }),
-                    tags = tags,
-                    rank = if (ranking != null) ((page - 1) * 20 + idx + 1) else null
+                    tags = mergedTags,
+                    rank = if (ranking != null) ((page - 1) * 20 + idx + 1) else null,
+                    categoryNames = categoryNames,
+                    displayTags = displayTags,
+                    gender = gender,
+                    createTimeSec = createTimeSec,
+                    isNewTag = isNewTag,
+                    officialRating = officialRating ?: cachedRating?.rating,
+                    platformScore = platformScore ?: cachedRating?.platformScore
                 )
             )
         }
@@ -866,6 +1076,7 @@ class HongguoApiClient(
         } else {
             cursors.remove(page + 1)
         }
+        ratingCache.saveIfDirty()
 
         return CatalogPageResult(
             items = summaries,
@@ -1173,36 +1384,64 @@ class HongguoApiClient(
                 if (res.optInt("code", -1) != 0) continue
                 val vd = res.optJSONObject("data")?.optJSONObject(seriesId)?.optJSONObject("video_data") ?: continue
                 val vl = vd.optJSONArray("video_list") ?: continue
-                val rawEps = ArrayList<Pair<Int, EpisodeItem>>(vl.length())
+                val rawEps = ArrayList<Triple<Int, Boolean, EpisodeItem>>(vl.length())
                 for (i in 0 until vl.length()) {
                     val item = vl.optJSONObject(i) ?: continue
                     val vid = item.optString("vid", "").trim()
                     if (!Regex("^\\d{1,30}$").matches(vid)) continue
                     val idx = item.optInt("vid_index", i + 1).coerceAtLeast(1)
                     val digg = item.optLong("digged_count", 0L).coerceAtLeast(0L)
-                    rawEps.add(idx to EpisodeItem(vid = vid, index = idx, title = "第${idx}集", diggCount = digg))
+                    val cmt = item.optLong("comment_count", 0L).coerceAtLeast(0L)
+                    val isNewly = item.optBoolean("is_newly_update", false)
+                    rawEps.add(
+                        Triple(
+                            idx,
+                            isNewly,
+                            EpisodeItem(vid = vid, index = idx, title = "第${idx}集", diggCount = digg, commentCount = cmt)
+                        )
+                    )
                 }
                 if (rawEps.isEmpty()) continue
-                val sortedEps = rawEps.sortedBy { it.first }.mapIndexed { idx, pair ->
-                    pair.second.copy(index = idx + 1, title = "第${idx + 1}集")
+                val sortedRows = rawEps.sortedBy { it.first }
+                val sortedEps = sortedRows.mapIndexed { idx, pair ->
+                    pair.third.copy(index = idx + 1, title = "第${idx + 1}集")
                 }
+                val newlyCount = sortedRows.count { it.second }
                 val followedCnt = vd.optLong("followed_cnt", 0L).coerceAtLeast(0L)
                 val seriesPlayCnt = vd.optLong("series_play_cnt", 0L).coerceAtLeast(0L)
-                val quality = DramaQualityEvaluator.evaluate(
+                val epLabel = cleanTitle(vd.optString("episode_right_text")).ifEmpty { "全${sortedEps.size}集" }
+                val isCompleted = parseCompletedStatus(epLabel)
+                val createTimeSec = vd.optLong("create_time", 0L).coerceAtLeast(0L)
+                val rawCat = vd.opt("category_schema")
+                val categoryNames = DramaTagger.parseCategoryNames(rawCat)
+                val displayTags = DramaTagger.pickDisplayTags(categoryNames)
+                val parsedGender = DramaTagger.parseGender(rawCat)
+                val gender = if (parsedGender >= 0) parsedGender else (ratingCache.get(seriesId)?.gender ?: -1)
+                val quality = buildQuality(
+                    seriesId = seriesId,
                     episodeDiggs = sortedEps.map { it.diggCount },
+                    episodeComments = sortedEps.map { it.commentCount },
                     followedCount = followedCnt,
-                    seriesPlayCount = seriesPlayCnt
+                    seriesPlayCount = seriesPlayCnt,
+                    createTimeSec = createTimeSec,
+                    isCompleted = isCompleted,
+                    newlyUpdatedCount = newlyCount
                 )
                 return DramaDetail(
                     seriesId = seriesId,
                     title = cleanTitle(vd.optString("series_title")).ifEmpty { "未命名短剧" },
                     cover = compatibleCover(vd.optString("series_cover").ifEmpty { vd.optString("cover_url") }),
                     description = cleanTitle(vd.optString("series_intro")),
-                    episodeLabel = cleanTitle(vd.optString("episode_right_text")).ifEmpty { "全${sortedEps.size}集" },
+                    episodeLabel = epLabel,
                     episodes = sortedEps,
                     followedCount = followedCnt,
                     seriesPlayCount = seriesPlayCnt,
-                    quality = quality
+                    quality = quality,
+                    categoryNames = categoryNames,
+                    displayTags = displayTags,
+                    gender = gender,
+                    createTimeSec = createTimeSec,
+                    isCompleted = isCompleted
                 )
             } catch (e: Exception) {
                 lastErr = e

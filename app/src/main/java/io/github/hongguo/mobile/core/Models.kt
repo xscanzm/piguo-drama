@@ -37,7 +37,30 @@ data class DramaQualityReport(
     val ep1Digg: Long = 0L,
     val ep2Digg: Long = 0L,
     val midTailDigg: Long = 0L,
-    val tailCollapsed: Boolean = false
+    val tailCollapsed: Boolean = false,
+    val qualityScore: Float = 0f,
+    val heatScore: Float = 0f,
+    val confidence: Float = 1f,
+    val isPending: Boolean = false,
+    val ageDays: Int = -1,
+    val createTimeSec: Long = 0L,
+    val isCompleted: Boolean? = null,
+    val endRetention: Float = 0f,
+    val cliffDrop: Float = 0f,
+    val cliffEpisode: Int = -1,
+    val stability: Float = 0f,
+    val baseDigg: Long = 0L,
+    val commentPerFollow: Float = 0f,
+    val officialRating: Float? = null,
+    val platformScore: Float? = null,
+    val sRetMid: Float = 0f,
+    val sRetEnd: Float = 0f,
+    val sCliff: Float = 0f,
+    val sInter: Float = 0f,
+    val sHeatAvg: Float = 0f,
+    val sHeatFav: Float = 0f,
+    val sHeatPlay: Float = 0f,
+    val verdict: String = ""
 )
 
 @Serializable
@@ -52,11 +75,19 @@ data class DramaSummary(
     val heat: String = "",
     val episodeLabel: String = "",
     val initialVid: String = "",
+    val initialEpisodeIndex: Int = 1,
     val recommendInfo: String = "",
     val recFilterInfo: String = "",
     val followedCount: Long = 0L,
     val seriesPlayCount: Long = 0L,
-    val quality: DramaQualityReport? = null
+    val quality: DramaQualityReport? = null,
+    val categoryNames: List<String> = emptyList(),
+    val displayTags: List<String> = emptyList(),
+    val gender: Int = -1,
+    val createTimeSec: Long = 0L,
+    val isNewTag: Boolean = false,
+    val officialRating: Float? = null,
+    val platformScore: Float? = null
 )
 
 data class GenreItem(
@@ -89,7 +120,8 @@ data class EpisodeItem(
     val vid: String,
     val index: Int, // 1-based
     val title: String,
-    val diggCount: Long = 0L
+    val diggCount: Long = 0L,
+    val commentCount: Long = 0L
 )
 
 @Serializable
@@ -102,7 +134,12 @@ data class DramaDetail(
     val episodes: List<EpisodeItem> = emptyList(),
     val followedCount: Long = 0L,
     val seriesPlayCount: Long = 0L,
-    val quality: DramaQualityReport? = null
+    val quality: DramaQualityReport? = null,
+    val categoryNames: List<String> = emptyList(),
+    val displayTags: List<String> = emptyList(),
+    val gender: Int = -1,
+    val createTimeSec: Long = 0L,
+    val isCompleted: Boolean? = null
 )
 
 data class PlayVariant(
@@ -178,7 +215,15 @@ data class AuthSession(
 @Serializable
 data class FeedPreferences(
     val dislikedSeriesIds: List<String> = emptyList(),
-    val dislikedTags: List<String> = emptyList()
+    val dislikedTags: List<String> = emptyList(),
+    val dislikedRecFilters: List<String> = emptyList()
+)
+
+@Serializable
+data class SeenFeedEntry(
+    val seriesId: String,
+    val recFilterInfo: String = "",
+    val seenAt: Long = System.currentTimeMillis()
 )
 
 sealed class SmsSendResult {

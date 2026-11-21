@@ -67,6 +67,7 @@ import io.github.hongguo.mobile.core.CatalogCategory
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.GenreItem
 import io.github.hongguo.mobile.core.SearchCursor
+import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.theme.BgBlack
 import io.github.hongguo.mobile.ui.theme.CoralRed
 import io.github.hongguo.mobile.ui.theme.GoldAccent
@@ -475,7 +476,7 @@ private fun DramaPosterCard(drama: DramaSummary, onClick: () -> Unit) {
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .height(48.dp)
+                    .height(56.dp)
                     .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f))))
             )
             drama.rank?.let { r ->
@@ -507,15 +508,30 @@ private fun DramaPosterCard(drama: DramaSummary, onClick: () -> Unit) {
                 else -> ""
             }
             if (epText.isNotEmpty()) {
-                Text(
-                    text = epText,
-                    color = Color.White.copy(alpha = 0.9f),
-                    fontSize = 10.sp,
+                Box(
                     modifier = Modifier
-                        .align(Alignment.BottomEnd)
+                        .align(Alignment.TopEnd)
                         .padding(6.dp)
-                )
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = epText,
+                        color = Color.White.copy(alpha = 0.92f),
+                        fontSize = 10.sp
+                    )
+                }
             }
+            CategoryTagChips(
+                tags = drama.displayTags,
+                gender = drama.gender,
+                isNew = drama.isNewTag,
+                small = true,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(6.dp)
+            )
         }
         Spacer(Modifier.height(6.dp))
         Text(

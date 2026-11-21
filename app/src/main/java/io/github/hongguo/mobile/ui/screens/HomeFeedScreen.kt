@@ -72,10 +72,13 @@ import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.DramaQualityReport
 import io.github.hongguo.mobile.core.DramaSummary
+import io.github.hongguo.mobile.core.HomeFeedEndedAction
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.resolveHomeFeedEndedAction
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
+import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.components.DarkHorseBadge
 import io.github.hongguo.mobile.ui.components.DramaQualityBadge
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
@@ -101,7 +104,9 @@ private data class HomeQualitySheetTarget(
     val report: DramaQualityReport,
     val episodeIndex: Int,
     val episodeDigg: Long,
-    val episodeDiggs: List<Long>
+    val episodeDiggs: List<Long>,
+    val tags: List<String> = emptyList(),
+    val episodeComments: List<Long> = emptyList()
 )
 
 @Composable
@@ -155,9 +160,14 @@ fun HomeFeedScreen(
     var retryTick by remember { mutableIntStateOf(0) }
     var lastDisliked by remember { mutableStateOf<Pair<Int, DramaSummary>?>(null) }
     var dislikeBannerSeq by remember { mutableIntStateOf(0) }
+    var sessionExcludedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val preloadedNextEpisodeSeries = remember { mutableSetOf<String>() }
 
     DisposableEffect(Unit) {
-        onDispose { container.localStore.flushWatchHistory() }
+        onDispose {
+            container.localStore.flushSeenFeed()
+            container.localStore.flushWatchHistory()
+        }
     }
 
     LaunchedEffect(dislikeBannerSeq) {
@@ -182,15 +192,21 @@ fun HomeFeedScreen(
         container.mediaCache.effectiveQuality(settings)
     }
 
-    fun filterFeed(list: List<DramaSummary>, qualityFilter: String): List<DramaSummary> {
+    fun filterFeed(
+        list: List<DramaSummary>,
+        qualityFilter: String,
+        excludedIds: Set<String> = sessionExcludedIds
+    ): List<DramaSummary> {
         val blockedIds = feedPrefs.dislikedSeriesIds.toHashSet()
         val blockedTags = feedPrefs.dislikedTags.toHashSet()
         return list.filter { item ->
+            val allItemTags = item.tags + item.categoryNames
             val notBlocked = item.seriesId !in blockedIds &&
-                (blockedTags.isEmpty() || item.tags.none { it in blockedTags })
+                item.seriesId !in excludedIds &&
+                (blockedTags.isEmpty() || allItemTags.none { it in blockedTags })
             val matchesQuality = when (qualityFilter) {
-                "no_c" -> item.quality == null || item.quality.grade != "C"
-                "as_only" -> item.quality?.grade == "S" || item.quality?.grade == "A"
+                "no_c" -> item.quality == null || item.quality.isPending || item.quality.grade != "C"
+                "as_only" -> item.quality?.let { !it.isPending && (it.grade == "S" || it.grade == "A") } == true
                 else -> true
             }
             notBlocked && matchesQuality
@@ -203,22 +219,38 @@ fun HomeFeedScreen(
             feedLoading = true
             feedError = null
             try {
+                val activeExcluded = if (reset) {
+                    val snapshot = buildSet {
+                        addAll(container.localStore.seenSeriesIdsSnapshot())
+                        for (h in container.localStore.history.value) add(h.seriesId)
+                        for (f in container.localStore.favorites.value) add(f.seriesId)
+                    }
+                    sessionExcludedIds = snapshot
+                    preloadedNextEpisodeSeries.clear()
+                    snapshot
+                } else {
+                    sessionExcludedIds
+                }
                 var targetPage = if (reset) 1 else currentPageNum + 1
                 var accumulatedRaw = if (reset) emptyList() else rawFeedItems
                 var localHasMore = true
                 var filteredNow = emptyList<DramaSummary>()
-                val maxFetches = if (reset) 3 else 2
+                val maxFetches = if (reset) 8 else 5
                 for (attempt in 0 until maxFetches) {
                     val res = container.apiClient.fetchRecommendFeed(cat.key, targetPage, forceRefresh = reset && attempt == 0)
                     val existingIds = accumulatedRaw.mapTo(HashSet()) { it.seriesId }
                     accumulatedRaw = accumulatedRaw + res.items.filter { existingIds.add(it.seriesId) }
                     currentPageNum = res.page
                     localHasMore = res.hasMore
-                    filteredNow = filterFeed(accumulatedRaw, settings.feedQualityFilter)
-                    if (!localHasMore || filteredNow.size >= (if (reset) 2 else feedItems.size + 1)) {
+                    filteredNow = filterFeed(accumulatedRaw, settings.feedQualityFilter, activeExcluded)
+                    if (!localHasMore || filteredNow.size >= (if (reset) 3 else feedItems.size + 1)) {
                         break
                     }
                     targetPage = res.page + 1
+                }
+                if (reset && filteredNow.isEmpty() && accumulatedRaw.isNotEmpty()) {
+                    sessionExcludedIds = emptySet()
+                    filteredNow = filterFeed(accumulatedRaw, settings.feedQualityFilter, emptySet())
                 }
                 rawFeedItems = accumulatedRaw
                 feedItems = filteredNow
@@ -265,13 +297,24 @@ fun HomeFeedScreen(
         }
     }
 
+    // Record a series as seen only after genuine dwell (>= 1.5s) on the active feed page
+    LaunchedEffect(pagerState.currentPage, feedItems, isRouteVisible, selectedChannelIdx) {
+        if (!isRouteVisible) return@LaunchedEffect
+        val cur = feedItems.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
+        val channelKey = channels[selectedChannelIdx].first.key
+        delay(1500L)
+        container.localStore.markFeedSeen(cur.seriesId, cur.recFilterInfo)
+        container.apiClient.recordSeenRecFilter(channelKey, cur.recFilterInfo)
+    }
+
     // Resolve current page's detail & playable video, plus preload next drama's episode
     LaunchedEffect(pagerState.currentPage, feedItems, effectiveQuality, retryTick) {
         if (feedItems.isEmpty()) return@LaunchedEffect
         val curItem = feedItems.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
         val existing = episodeStates[curItem.seriesId]
         if (existing?.media == null && existing?.loading != true) {
-            episodeStates[curItem.seriesId] = (existing ?: FeedEpisodeState()).copy(loading = true, error = null)
+            episodeStates[curItem.seriesId] = (existing ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex))
+                .copy(loading = true, error = null)
             try {
                 val lastHist = history.firstOrNull { it.seriesId == curItem.seriesId }
                 if (lastHist == null && curItem.initialVid.isNotEmpty() && existing?.detail == null) {
@@ -279,8 +322,10 @@ fun HomeFeedScreen(
                     scope.launch {
                         runCatching {
                             val d = container.apiClient.fetchSeriesDetail(curItem.seriesId)
+                            val resolvedEpIdx = d.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
+                                ?: curItem.initialEpisodeIndex.coerceIn(1, d.episodes.size.coerceAtLeast(1))
                             episodeStates[curItem.seriesId]?.let { cur ->
-                                episodeStates[curItem.seriesId] = cur.copy(detail = d)
+                                episodeStates[curItem.seriesId] = cur.copy(detail = d, episodeIndex = resolvedEpIdx)
                             }
                         }
                     }
@@ -290,18 +335,26 @@ fun HomeFeedScreen(
                         seriesId = curItem.seriesId,
                         bypassCooldown = retryTick > 0
                     )
-                    val curDetail = episodeStates[curItem.seriesId]?.detail
+                    val latestState = episodeStates[curItem.seriesId]
+                    val curDetail = latestState?.detail
+                    val resolvedEpIdx = curDetail?.episodes?.firstOrNull { it.vid == curItem.initialVid }?.index
+                        ?: latestState?.episodeIndex
+                        ?: curItem.initialEpisodeIndex
                     episodeStates[curItem.seriesId] = FeedEpisodeState(
                         detail = curDetail,
-                        episodeIndex = 1,
+                        episodeIndex = resolvedEpIdx,
                         media = media,
                         loading = false,
                         error = null
                     )
                 } else {
                     val detail = existing?.detail ?: container.apiClient.fetchSeriesDetail(curItem.seriesId)
-                    val epIdx = (lastHist?.lastEpisodeIndex ?: existing?.episodeIndex ?: 1)
-                        .coerceIn(1, detail.episodes.size)
+                    val epIdx = (
+                        lastHist?.lastEpisodeIndex
+                            ?: detail.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
+                            ?: existing?.episodeIndex
+                            ?: curItem.initialEpisodeIndex
+                        ).coerceIn(1, detail.episodes.size.coerceAtLeast(1))
                     val vid = detail.episodes[epIdx - 1].vid
                     val media = container.mediaCache.resolvePlayableSource(
                         vid = vid,
@@ -318,8 +371,9 @@ fun HomeFeedScreen(
                     )
                 }
             } catch (e: Exception) {
-                episodeStates[curItem.seriesId] = (episodeStates[curItem.seriesId] ?: FeedEpisodeState())
-                    .copy(loading = false, error = e.message ?: "片源准备失败")
+                episodeStates[curItem.seriesId] = (
+                    episodeStates[curItem.seriesId] ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex)
+                    ).copy(loading = false, error = e.message ?: "片源准备失败")
             }
         }
 
@@ -383,7 +437,7 @@ fun HomeFeedScreen(
                 modifier = Modifier.fillMaxSize()
             ) { page ->
                 val drama = feedItems[page]
-                val epState = episodeStates[drama.seriesId] ?: FeedEpisodeState()
+                val epState = episodeStates[drama.seriesId] ?: FeedEpisodeState(episodeIndex = drama.initialEpisodeIndex)
                 val isPageActive = isRouteVisible && page == pagerState.currentPage
                 val isFav = favorites.any { it.seriesId == drama.seriesId }
                 val totalEps = epState.detail?.episodes?.size ?: drama.episodeCount
@@ -417,8 +471,20 @@ fun HomeFeedScreen(
                         },
                         onEnded = {
                             if (container.sleepTimer.consumeEpisodeEndTrigger()) return@VerticalDramaPlayer
-                            if (settings.autoPlayNext && page + 1 < feedItems.size) {
-                                scope.launch { pagerState.animateScrollToPage(page + 1) }
+                            if (!settings.autoPlayNext || !isPageActive) return@VerticalDramaPlayer
+                            when (val action = resolveHomeFeedEndedAction(
+                                currentEpisodeIndex = epState.episodeIndex,
+                                totalEpisodes = totalEps,
+                                currentPage = page,
+                                feedSize = feedItems.size
+                            )) {
+                                is HomeFeedEndedAction.OpenNextEpisode -> {
+                                    onOpenSeriesPlayer(drama.seriesId, action.nextEpisodeIndex, 0L)
+                                }
+                                is HomeFeedEndedAction.AdvanceFeedPage -> {
+                                    scope.launch { pagerState.animateScrollToPage(action.nextPage) }
+                                }
+                                HomeFeedEndedAction.None -> Unit
                             }
                         },
                         onProgressUpdate = { pos, dur ->
@@ -426,23 +492,23 @@ fun HomeFeedScreen(
                                 qualityResumeBySeries = null
                             }
                             livePositions[drama.seriesId] = pos
-                            container.localStore.recordWatchProgress(
-                                seriesId = drama.seriesId,
-                                title = epState.detail?.title ?: drama.title,
-                                cover = epState.detail?.cover?.ifEmpty { drama.cover } ?: drama.cover,
-                                totalEpisodes = totalEps,
-                                episodeIndex = epState.episodeIndex,
-                                positionMs = pos,
-                                durationMs = dur
-                            )
-                            val activeVid = epState.detail?.episodes?.getOrNull(epState.episodeIndex - 1)?.vid
-                                ?: drama.initialVid
-                            container.accountManager.reportWatchProgressAsync(
-                                seriesId = drama.seriesId,
-                                vid = activeVid,
-                                episodeIndex = epState.episodeIndex,
-                                positionMs = pos
-                            )
+                            if (settings.preloadNextEpisode && dur > 0L && pos * 2L >= dur) {
+                                val nextEp = epState.detail?.episodes?.firstOrNull {
+                                    it.index == epState.episodeIndex + 1
+                                } ?: epState.detail?.episodes?.getOrNull(epState.episodeIndex)
+                                if (nextEp != null && preloadedNextEpisodeSeries.add(drama.seriesId)) {
+                                    scope.launch {
+                                        runCatching {
+                                            container.mediaCache.preloadInBackground(
+                                                vids = listOf(nextEp.vid),
+                                                quality = effectiveQuality,
+                                                seriesId = drama.seriesId,
+                                                wifiOnly = settings.wifiOnlyPreload
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         },
                         onLongPressSpeedChange = { longPressActive = it },
                         isFullscreen = isFullscreen,
@@ -456,7 +522,7 @@ fun HomeFeedScreen(
                                 curVideoH = h
                             }
                         },
-                        onFlushProgress = { container.localStore.flushWatchHistory() },
+                        onFlushProgress = { container.localStore.flushSeenFeed() },
                         showSeekBar = !cleanMode,
                         showFullscreenHint = !cleanMode
                     )
@@ -503,7 +569,11 @@ fun HomeFeedScreen(
                                     if (d != null) {
                                         showEpisodeSheetFor = d
                                     } else {
-                                        onOpenSeriesPlayer(drama.seriesId, 1, 0L)
+                                        onOpenSeriesPlayer(
+                                            drama.seriesId,
+                                            epState.episodeIndex,
+                                            livePositions[drama.seriesId] ?: resumePos
+                                        )
                                     }
                                 }
                             )
@@ -517,7 +587,7 @@ fun HomeFeedScreen(
                                 label = "不看",
                                 onClick = {
                                     val removedIdx = feedItems.indexOfFirst { it.seriesId == drama.seriesId }.coerceAtLeast(0)
-                                    container.localStore.dislikeSeries(drama.seriesId)
+                                    container.localStore.dislikeSeries(drama.seriesId, drama.recFilterInfo)
                                     scope.launch { container.apiClient.submitFeedDislike(drama) }
                                     episodeStates.remove(drama.seriesId)
                                     rawFeedItems = rawFeedItems.filter { it.seriesId != drama.seriesId }
@@ -565,6 +635,9 @@ fun HomeFeedScreen(
                         val displayTitle = epState.detail?.title ?: drama.title
                         val qualityReport = epState.detail?.quality ?: drama.quality
                         val epDiggList = epState.detail?.episodes?.map { it.diggCount }.orEmpty()
+                        val epCommentList = epState.detail?.episodes?.map { it.commentCount }.orEmpty()
+                        val sheetTags = epState.detail?.categoryNames?.ifEmpty { null }
+                            ?: drama.categoryNames.ifEmpty { drama.tags }
                         val curEpDigg = epState.detail?.episodes?.getOrNull(epState.episodeIndex - 1)?.diggCount
                             ?: qualityReport?.ep1Digg
                             ?: 0L
@@ -575,7 +648,9 @@ fun HomeFeedScreen(
                                     report = qualityReport,
                                     episodeIndex = epState.episodeIndex,
                                     episodeDigg = curEpDigg,
-                                    episodeDiggs = epDiggList
+                                    episodeDiggs = epDiggList,
+                                    tags = sheetTags,
+                                    episodeComments = epCommentList
                                 )
                             }
                         }
@@ -620,6 +695,18 @@ fun HomeFeedScreen(
                                 }
                                 Spacer(Modifier.height(6.dp))
                             }
+                            val displayTags = epState.detail?.displayTags?.ifEmpty { null }
+                                ?: drama.displayTags.ifEmpty { drama.tags.take(2) }
+                            val tagGender = epState.detail?.gender?.takeIf { it >= 0 } ?: drama.gender
+                            val tagIsNew = drama.isNewTag || ((qualityReport?.ageDays ?: -1) in 0..7)
+                            if (displayTags.isNotEmpty() || tagIsNew) {
+                                CategoryTagChips(
+                                    tags = displayTags,
+                                    gender = tagGender,
+                                    isNew = tagIsNew
+                                )
+                                Spacer(Modifier.height(6.dp))
+                            }
                             Text(
                                 text = displayTitle,
                                 color = Color.White,
@@ -639,16 +726,6 @@ fun HomeFeedScreen(
                                     maxLines = if (descExpanded) 5 else 2,
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.clickable { descExpanded = !descExpanded }
-                                )
-                            }
-                            if (drama.tags.isNotEmpty()) {
-                                Spacer(Modifier.height(6.dp))
-                                Text(
-                                    text = drama.tags.joinToString(" · "),
-                                    color = Color.White.copy(alpha = 0.7f),
-                                    fontSize = 12.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Spacer(Modifier.height(10.dp))
@@ -884,7 +961,7 @@ fun HomeFeedScreen(
         ) {
             if (dislikedPair != null) {
                 val (origIdx, removed) = dislikedPair
-                val firstTag = removed.tags.firstOrNull()
+                val firstTag = removed.displayTags.firstOrNull() ?: removed.tags.firstOrNull()
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -900,7 +977,8 @@ fun HomeFeedScreen(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.clickable {
-                            container.localStore.undislikeSeries(removed.seriesId)
+                            container.localStore.undislikeSeries(removed.seriesId, removed.recFilterInfo)
+                            container.apiClient.removeDislikedRecFilter(removed.recFilterInfo)
                             if (rawFeedItems.none { it.seriesId == removed.seriesId }) {
                                 val rMutable = rawFeedItems.toMutableList()
                                 rMutable.add(origIdx.coerceIn(0, rMutable.size), removed)
@@ -955,6 +1033,8 @@ fun HomeFeedScreen(
             currentEpisodeIndex = target.episodeIndex,
             currentEpisodeDigg = target.episodeDigg,
             episodeDiggs = target.episodeDiggs,
+            tags = target.tags,
+            episodeComments = target.episodeComments,
             onDismiss = { showQualitySheetFor = null }
         )
     }

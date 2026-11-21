@@ -5,10 +5,12 @@
 // and src/native/playback-signature.js (Argus/Ladon/Simon).
 package io.github.hongguo.mobile.core
 
+import kotlinx.serialization.Serializable
 import java.math.BigInteger
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
+@Serializable
 data class DeviceIdentity(
     val deviceId: String,
     val iid: String,

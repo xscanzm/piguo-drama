@@ -23,6 +23,8 @@ class LocalStore(context: Context) {
     private val fileWriteLock = Any()
     @Volatile
     private var historyWriteJob: Job? = null
+    @Volatile
+    private var seenWriteJob: Job? = null
 
     private val dir = File(context.filesDir, "hongguo_store").apply { mkdirs() }
     private val historyFile = File(dir, "watch_history.json")
@@ -31,6 +33,10 @@ class LocalStore(context: Context) {
     private val authFile = File(dir, "auth_session.json")
     private val feedPrefsFile = File(dir, "feed_preferences.json")
     private val searchHistoryFile = File(dir, "search_history.json")
+    private val seenFeedStore = SeenFeedStore(File(dir, "seen_feed.json"))
+
+    private val _seenFeedCount = MutableStateFlow(seenFeedStore.size())
+    val seenFeedCount: StateFlow<Int> = _seenFeedCount.asStateFlow()
 
     private val _history = MutableStateFlow(loadList<WatchHistoryEntry>(historyFile))
     val history: StateFlow<List<WatchHistoryEntry>> = _history.asStateFlow()
@@ -191,22 +197,66 @@ class LocalStore(context: Context) {
     }
 
     @Synchronized
-    fun dislikeSeries(seriesId: String) {
+    fun dislikeSeries(seriesId: String, recFilterInfo: String = "") {
         val cur = _feedPreferences.value
         val nextIds = (listOf(seriesId) + cur.dislikedSeriesIds.filter { it != seriesId }).take(500)
-        val next = cur.copy(dislikedSeriesIds = nextIds)
+        val cleanFilter = recFilterInfo.trim()
+        val nextFilters = if (cleanFilter.isNotEmpty()) {
+            (listOf(cleanFilter) + cur.dislikedRecFilters.filter { it != cleanFilter }).take(100)
+        } else {
+            cur.dislikedRecFilters
+        }
+        val next = cur.copy(dislikedSeriesIds = nextIds, dislikedRecFilters = nextFilters)
         _feedPreferences.value = next
         persistAsync(feedPrefsFile, json.encodeToString(next))
     }
 
     @Synchronized
-    fun undislikeSeries(seriesId: String) {
+    fun undislikeSeries(seriesId: String, recFilterInfo: String = "") {
         val cur = _feedPreferences.value
         val nextIds = cur.dislikedSeriesIds.filter { it != seriesId }
-        if (nextIds.size == cur.dislikedSeriesIds.size) return
-        val next = cur.copy(dislikedSeriesIds = nextIds)
+        val cleanFilter = recFilterInfo.trim()
+        val nextFilters = if (cleanFilter.isNotEmpty()) {
+            cur.dislikedRecFilters.filter { it != cleanFilter }
+        } else {
+            cur.dislikedRecFilters
+        }
+        if (nextIds.size == cur.dislikedSeriesIds.size && nextFilters.size == cur.dislikedRecFilters.size) return
+        val next = cur.copy(dislikedSeriesIds = nextIds, dislikedRecFilters = nextFilters)
         _feedPreferences.value = next
         persistAsync(feedPrefsFile, json.encodeToString(next))
+    }
+
+    fun markFeedSeen(seriesId: String, recFilterInfo: String = "") {
+        val count = seenFeedStore.markSeen(seriesId, recFilterInfo)
+        _seenFeedCount.value = count
+        seenWriteJob?.cancel()
+        seenWriteJob = ioScope.launch {
+            delay(5_000L)
+            seenFeedStore.flush()
+        }
+    }
+
+    fun flushSeenFeed() {
+        seenWriteJob?.cancel()
+        seenWriteJob = null
+        ioScope.launch {
+            seenFeedStore.flush()
+        }
+    }
+
+    fun seenSeriesIdsSnapshot(): Set<String> = seenFeedStore.seenIdsSnapshot()
+
+    fun recentSeenRecFilters(limit: Int = 30): List<String> = seenFeedStore.recentRecFilters(limit)
+
+    fun clearSeenFeed() {
+        seenFeedStore.clear()
+        _seenFeedCount.value = 0
+        seenWriteJob?.cancel()
+        seenWriteJob = null
+        ioScope.launch {
+            seenFeedStore.flush()
+        }
     }
 
     @Synchronized
