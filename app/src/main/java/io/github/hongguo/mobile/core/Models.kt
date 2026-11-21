@@ -227,6 +227,16 @@ data class SeenFeedEntry(
     val seenAt: Long = System.currentTimeMillis()
 )
 
+@Serializable
+data class WarmFeedEntry(
+    val summary: DramaSummary,
+    val detail: DramaDetail? = null,
+    val vid: String,
+    val episodeIndex: Int = 1,
+    val qualityKey: String = QualityPreference.AUTO.key,
+    val cachedAt: Long = System.currentTimeMillis()
+)
+
 sealed class SmsSendResult {
     data class Sent(val message: String = "验证码已发送") : SmsSendResult()
     data class NeedsWebVerify(val reason: String) : SmsSendResult()

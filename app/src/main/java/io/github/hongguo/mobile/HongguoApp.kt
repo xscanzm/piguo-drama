@@ -3,6 +3,7 @@ package io.github.hongguo.mobile
 
 import android.app.Application
 import io.github.hongguo.mobile.core.AccountManager
+import io.github.hongguo.mobile.core.AppUpdateManager
 import io.github.hongguo.mobile.core.HongguoApiClient
 import io.github.hongguo.mobile.core.LocalStore
 import io.github.hongguo.mobile.player.ExoPlayerPool
@@ -27,7 +28,13 @@ class AppContainer(app: Application) {
         deviceIdentityFile = File(app.filesDir, "hongguo_store/device_identity.json")
     ) { localStore.authSession.value }
     val accountManager = AccountManager(httpClient, localStore, apiClient)
-    val mediaCache = MediaCacheManager(app, apiClient, httpClient)
+    val mediaCache = MediaCacheManager(
+        context = app,
+        api = apiClient,
+        httpClient = httpClient,
+        protectedCacheFilenamesProvider = { localStore.warmProtectedCacheFilenames() }
+    )
+    val updateManager = AppUpdateManager(app, httpClient)
     val playerPool = ExoPlayerPool()
     val sleepTimer = SleepTimerManager()
     val isInPipMode = MutableStateFlow(false)

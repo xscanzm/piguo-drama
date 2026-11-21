@@ -34,9 +34,13 @@ class LocalStore(context: Context) {
     private val feedPrefsFile = File(dir, "feed_preferences.json")
     private val searchHistoryFile = File(dir, "search_history.json")
     private val seenFeedStore = SeenFeedStore(File(dir, "seen_feed.json"))
+    private val warmFeedStore = FeedWarmCacheStore(File(dir, "warm_feed_cache.json"))
 
     private val _seenFeedCount = MutableStateFlow(seenFeedStore.size())
     val seenFeedCount: StateFlow<Int> = _seenFeedCount.asStateFlow()
+
+    private val _warmFeedCount = MutableStateFlow(warmFeedStore.size())
+    val warmFeedCount: StateFlow<Int> = _warmFeedCount.asStateFlow()
 
     private val _history = MutableStateFlow(loadList<WatchHistoryEntry>(historyFile))
     val history: StateFlow<List<WatchHistoryEntry>> = _history.asStateFlow()
@@ -214,6 +218,7 @@ class LocalStore(context: Context) {
         val next = cur.copy(dislikedSeriesIds = nextIds, dislikedRecFilters = nextFilters)
         _feedPreferences.value = next
         persistAsync(feedPrefsFile, json.encodeToString(next))
+        removeWarmFeedEntry(seriesId)
     }
 
     @Synchronized
@@ -240,6 +245,37 @@ class LocalStore(context: Context) {
             delay(5_000L)
             seenFeedStore.flush()
         }
+        removeWarmFeedEntry(seriesId)
+    }
+
+    fun warmFeedEntriesSnapshot(): List<WarmFeedEntry> = warmFeedStore.entriesSnapshot()
+
+    fun warmFeedSeriesIds(): Set<String> = warmFeedStore.seriesIdsSnapshot()
+
+    fun warmProtectedCacheFilenames(): Set<String> = warmFeedStore.protectedFilenames()
+
+    fun upsertWarmFeedEntry(entry: WarmFeedEntry) {
+        val n = warmFeedStore.upsert(entry)
+        _warmFeedCount.value = n
+    }
+
+    fun removeWarmFeedEntry(seriesId: String) {
+        val n = warmFeedStore.remove(seriesId)
+        _warmFeedCount.value = n
+    }
+
+    fun pruneWarmFeedEntries(
+        excludedIds: Set<String>,
+        isValid: (WarmFeedEntry) -> Boolean
+    ): List<WarmFeedEntry> {
+        val remaining = warmFeedStore.prune(excludedIds, isValid)
+        _warmFeedCount.value = remaining.size
+        return remaining
+    }
+
+    fun clearWarmFeedCache() {
+        warmFeedStore.clear()
+        _warmFeedCount.value = 0
     }
 
     fun flushSeenFeed() {

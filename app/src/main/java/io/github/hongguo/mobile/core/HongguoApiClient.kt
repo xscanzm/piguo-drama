@@ -1265,6 +1265,12 @@ class HongguoApiClient(
         return if (cached.first > System.currentTimeMillis()) cached.second else null
     }
 
+    fun warmDetailCache(detail: DramaDetail) {
+        if (detail.seriesId.isNotBlank() && detail.episodes.isNotEmpty()) {
+            detailCache.putIfAbsent(detail.seriesId, (System.currentTimeMillis() + 300_000L) to detail)
+        }
+    }
+
     suspend fun fetchSeriesDetail(seriesId: String, forceRefresh: Boolean = false): DramaDetail = withContext(Dispatchers.IO) {
         require(Regex("^\\d{6,30}$").matches(seriesId)) { "无效剧集编号" }
         val cached = detailCache[seriesId]

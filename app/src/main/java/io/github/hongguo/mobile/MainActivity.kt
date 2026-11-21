@@ -22,6 +22,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -32,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavType
@@ -40,6 +42,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import io.github.hongguo.mobile.ui.components.AppUpdateDialog
 import io.github.hongguo.mobile.ui.screens.DramaSeriesPlayerScreen
 import io.github.hongguo.mobile.ui.screens.HomeFeedScreen
 import io.github.hongguo.mobile.ui.screens.LibraryScreen
@@ -80,14 +83,22 @@ private enum class MainTab(val route: String, val label: String, val icon: Image
 
 @Composable
 private fun HongguoRootApp(container: AppContainer) {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route ?: MainTab.HOME.route
     val inPip by container.isInPipMode.collectAsState()
+    val updateStatus by container.updateManager.status.collectAsState()
+    val showUpdateDialog by container.updateManager.dialogVisible.collectAsState()
     var feedFullscreen by remember { mutableStateOf(false) }
     val showBottomBar = !inPip && MainTab.entries.any { it.route == currentRoute } && !(currentRoute == MainTab.HOME.route && feedFullscreen)
     var searchFocusTrigger by remember { mutableIntStateOf(0) }
     var homeRefreshTrigger by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(2_500L)
+        container.updateManager.checkForUpdates(silent = true)
+    }
 
     fun openSeriesPlayer(seriesId: String, episodeIndex: Int = 1, positionMs: Long = 0L) {
         val hist = if (episodeIndex == 1 && positionMs == 0L) {
@@ -203,5 +214,15 @@ private fun HongguoRootApp(container: AppContainer) {
                 }
             }
         }
+    }
+
+    if (showUpdateDialog) {
+        AppUpdateDialog(
+            status = updateStatus,
+            onDismiss = { skip -> container.updateManager.dismissUpdateDialog(skipInSession = skip) },
+            onStartDownload = { info -> container.updateManager.startDownloadAndInstall(info, context) },
+            onTriggerInstall = { ready -> container.updateManager.triggerInstall(context, ready.apkFile, ready.info) },
+            onOpenBrowser = { url -> container.updateManager.openReleasePageInBrowser(context, url) }
+        )
     }
 }

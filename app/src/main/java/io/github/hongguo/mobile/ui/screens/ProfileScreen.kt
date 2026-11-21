@@ -47,14 +47,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import io.github.hongguo.mobile.AppContainer
+import io.github.hongguo.mobile.BuildConfig
 import io.github.hongguo.mobile.R
+import io.github.hongguo.mobile.core.LATEST_RELEASE_PAGE_URL
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.UpdateStatus
 import io.github.hongguo.mobile.ui.components.PhoneLoginSheet
 import io.github.hongguo.mobile.ui.components.QrLoginSheet
 import io.github.hongguo.mobile.ui.components.WebLoginDialog
@@ -70,11 +74,14 @@ import kotlinx.coroutines.withContext
 
 @Composable
 fun ProfileScreen(container: AppContainer) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settings by container.localStore.settings.collectAsState()
     val authSession by container.localStore.authSession.collectAsState()
     val feedPrefs by container.localStore.feedPreferences.collectAsState()
     val seenFeedCount by container.localStore.seenFeedCount.collectAsState()
+    val warmFeedCount by container.localStore.warmFeedCount.collectAsState()
+    val updateStatus by container.updateManager.status.collectAsState()
     val syncing by container.accountManager.syncing.collectAsState()
     val sessionExpired by container.accountManager.sessionExpired.collectAsState()
     var cacheBytes by remember { mutableLongStateOf(0L) }
@@ -432,13 +439,18 @@ fun ProfileScreen(container: AppContainer) {
                 Text("视频缓冲缓存", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
                 val mb = cacheBytes / (1024.0 * 1024.0)
-                Text("当前占用 ${"%.1f".format(mb)} MB（流缓存与加密缓存上限约 450 MB）", color = TextSecondary, fontSize = 12.sp)
+                Text(
+                    "当前占用 ${"%.1f".format(mb)} MB · 已预缓 $warmFeedCount 部冷启动秒开短剧",
+                    color = TextSecondary,
+                    fontSize = 12.sp
+                )
             }
             Button(
                 onClick = {
                     scope.launch {
                         val refreshed = withContext(Dispatchers.IO) {
                             container.mediaCache.clearAllCache()
+                            container.localStore.clearWarmFeedCache()
                             container.mediaCache.getCacheSizeBytes()
                         }
                         cacheBytes = refreshed
@@ -547,7 +559,8 @@ fun ProfileScreen(container: AppContainer) {
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
                 Image(
                     painter = painterResource(id = R.drawable.ic_brand_logo),
@@ -557,10 +570,80 @@ fun ProfileScreen(container: AppContainer) {
                         .size(44.dp)
                         .clip(RoundedCornerShape(10.dp))
                 )
-                Column {
-                    Text("皮果刷剧", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "皮果刷剧 v${BuildConfig.VERSION_NAME}",
+                        color = TextPrimary,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                     Text("开源无广告短剧客户端 · GPL-3.0", color = TextSecondary, fontSize = 12.sp)
                 }
+                val hasNewUpdate = updateStatus is UpdateStatus.Available ||
+                    updateStatus is UpdateStatus.ReadyToInstall
+                Button(
+                    onClick = {
+                        when (updateStatus) {
+                            is UpdateStatus.Available,
+                            is UpdateStatus.ReadyToInstall,
+                            is UpdateStatus.Downloading -> container.updateManager.openUpdateDialog()
+                            else -> container.updateManager.checkForUpdates(silent = false)
+                        }
+                    },
+                    enabled = updateStatus !is UpdateStatus.Checking,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (hasNewUpdate) CoralRed else SurfaceElevated
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = when (updateStatus) {
+                            is UpdateStatus.Checking -> "检查中..."
+                            is UpdateStatus.Available -> "发现新版"
+                            is UpdateStatus.ReadyToInstall -> "安装新版"
+                            is UpdateStatus.Downloading -> "下载中"
+                            else -> "检查更新"
+                        },
+                        color = if (hasNewUpdate) Color.White else TextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = if (hasNewUpdate) FontWeight.SemiBold else FontWeight.Normal
+                    )
+                }
+            }
+            when (val u = updateStatus) {
+                is UpdateStatus.Checking -> {
+                    Text("正在检查更新...", color = TextSecondary, fontSize = 12.sp)
+                }
+                is UpdateStatus.UpToDate -> {
+                    Text("当前已是最新版本 (v${u.currentVersion})", color = Color(0xFF7AD97A), fontSize = 12.sp)
+                }
+                is UpdateStatus.Error -> {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = u.message,
+                            color = CoralRed,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "前往 Releases",
+                            color = Color(0xFF8EC5FF),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable {
+                                container.updateManager.openReleasePageInBrowser(
+                                    context,
+                                    u.info?.htmlUrl ?: LATEST_RELEASE_PAGE_URL
+                                )
+                            }
+                        )
+                    }
+                }
+                else -> Unit
             }
             Column(
                 verticalArrangement = Arrangement.spacedBy(3.dp),

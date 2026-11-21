@@ -138,14 +138,59 @@ fun HomeFeedScreen(
     }
 
     var selectedChannelIdx by remember { mutableIntStateOf(0) }
-    var rawFeedItems by remember { mutableStateOf<List<DramaSummary>>(emptyList()) }
-    var feedItems by remember { mutableStateOf<List<DramaSummary>>(emptyList()) }
+    val initialBootState = remember {
+        val prefs = container.localStore.feedPreferences.value
+        val curSettings = container.localStore.settings.value
+        val excluded = buildSet {
+            addAll(container.localStore.seenSeriesIdsSnapshot())
+            for (h in container.localStore.history.value) add(h.seriesId)
+            for (f in container.localStore.favorites.value) add(f.seriesId)
+        }
+        val blockedIds = prefs.dislikedSeriesIds.toHashSet()
+        val blockedTags = prefs.dislikedTags.toHashSet()
+        val warmEntries = container.localStore.pruneWarmFeedEntries(excluded + blockedIds) { entry ->
+            container.mediaCache.hasLocalFile(entry.vid, entry.qualityKey)
+        }.filter { entry ->
+            val summary = entry.summary
+            val allTags = summary.tags + summary.categoryNames
+            val tagOk = blockedTags.isEmpty() || allTags.none { it in blockedTags }
+            val qualityOk = when (curSettings.feedQualityFilter) {
+                "no_c" -> summary.quality == null || summary.quality.isPending || summary.quality.grade != "C"
+                "as_only" -> summary.quality?.let { !it.isPending && (it.grade == "S" || it.grade == "A") } == true
+                else -> true
+            }
+            tagOk && qualityOk
+        }
+        Triple(excluded, warmEntries.map { it.summary }, warmEntries)
+    }
+
+    var rawFeedItems by remember { mutableStateOf(initialBootState.second) }
+    var feedItems by remember { mutableStateOf(initialBootState.second) }
     var currentPageNum by remember { mutableIntStateOf(1) }
     var hasMore by remember { mutableStateOf(true) }
     var feedLoading by remember { mutableStateOf(false) }
     var feedError by remember { mutableStateOf<String?>(null) }
 
-    val episodeStates = remember { mutableStateMapOf<String, FeedEpisodeState>() }
+    val episodeStates = remember {
+        mutableStateMapOf<String, FeedEpisodeState>().apply {
+            for (entry in initialBootState.third) {
+                entry.detail?.let { container.apiClient.warmDetailCache(it) }
+                val localMedia = container.mediaCache.peekLocalFileSource(entry.vid, entry.qualityKey)
+                if (localMedia != null) {
+                    put(
+                        entry.summary.seriesId,
+                        FeedEpisodeState(
+                            detail = entry.detail,
+                            episodeIndex = entry.episodeIndex,
+                            media = localMedia,
+                            loading = false,
+                            error = null
+                        )
+                    )
+                }
+            }
+        }
+    }
     val livePositions = remember { mutableStateMapOf<String, Long>() }
     var qualityResumeBySeries by remember { mutableStateOf<Pair<String, Long>?>(null) }
     var curVideoW by remember { mutableIntStateOf(0) }
@@ -160,7 +205,8 @@ fun HomeFeedScreen(
     var retryTick by remember { mutableIntStateOf(0) }
     var lastDisliked by remember { mutableStateOf<Pair<Int, DramaSummary>?>(null) }
     var dislikeBannerSeq by remember { mutableIntStateOf(0) }
-    var sessionExcludedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var sessionExcludedIds by remember { mutableStateOf(initialBootState.first) }
+    var handledInitialBoot by remember { mutableStateOf(false) }
     val preloadedNextEpisodeSeries = remember { mutableSetOf<String>() }
 
     DisposableEffect(Unit) {
@@ -213,7 +259,7 @@ fun HomeFeedScreen(
         }
     }
 
-    fun loadFeed(reset: Boolean) {
+    fun loadFeed(reset: Boolean, appendFreshFirstPage: Boolean = false) {
         val cat = channels[selectedChannelIdx].first
         scope.launch {
             feedLoading = true
@@ -231,19 +277,28 @@ fun HomeFeedScreen(
                 } else {
                     sessionExcludedIds
                 }
-                var targetPage = if (reset) 1 else currentPageNum + 1
+                var targetPage = if (reset || appendFreshFirstPage) 1 else currentPageNum + 1
                 var accumulatedRaw = if (reset) emptyList() else rawFeedItems
                 var localHasMore = true
                 var filteredNow = emptyList<DramaSummary>()
                 val maxFetches = if (reset) 8 else 5
+                val targetSize = when {
+                    reset -> 3
+                    appendFreshFirstPage -> feedItems.size + 3
+                    else -> feedItems.size + 1
+                }
                 for (attempt in 0 until maxFetches) {
-                    val res = container.apiClient.fetchRecommendFeed(cat.key, targetPage, forceRefresh = reset && attempt == 0)
+                    val res = container.apiClient.fetchRecommendFeed(
+                        cat.key,
+                        targetPage,
+                        forceRefresh = (reset || appendFreshFirstPage) && attempt == 0
+                    )
                     val existingIds = accumulatedRaw.mapTo(HashSet()) { it.seriesId }
                     accumulatedRaw = accumulatedRaw + res.items.filter { existingIds.add(it.seriesId) }
                     currentPageNum = res.page
                     localHasMore = res.hasMore
                     filteredNow = filterFeed(accumulatedRaw, settings.feedQualityFilter, activeExcluded)
-                    if (!localHasMore || filteredNow.size >= (if (reset) 3 else feedItems.size + 1)) {
+                    if (!localHasMore || filteredNow.size >= targetSize) {
                         break
                     }
                     targetPage = res.page + 1
@@ -256,7 +311,9 @@ fun HomeFeedScreen(
                 feedItems = filteredNow
                 hasMore = localHasMore
             } catch (e: Exception) {
-                feedError = e.message ?: "推荐流加载失败"
+                if (!appendFreshFirstPage || feedItems.isEmpty()) {
+                    feedError = e.message ?: "推荐流加载失败"
+                }
             } finally {
                 feedLoading = false
             }
@@ -264,10 +321,19 @@ fun HomeFeedScreen(
     }
 
     LaunchedEffect(selectedChannelIdx, authSession?.profile?.userId) {
-        rawFeedItems = emptyList()
-        feedItems = emptyList()
-        episodeStates.clear()
-        loadFeed(reset = true)
+        if (!handledInitialBoot) {
+            handledInitialBoot = true
+            if (selectedChannelIdx == 0 && feedItems.isNotEmpty()) {
+                loadFeed(reset = false, appendFreshFirstPage = true)
+            } else {
+                loadFeed(reset = true)
+            }
+        } else {
+            rawFeedItems = emptyList()
+            feedItems = emptyList()
+            episodeStates.clear()
+            loadFeed(reset = true)
+        }
     }
 
     LaunchedEffect(settings.feedQualityFilter, feedPrefs) {
@@ -305,6 +371,27 @@ fun HomeFeedScreen(
         delay(1500L)
         container.localStore.markFeedSeen(cur.seriesId, cur.recFilterInfo)
         container.apiClient.recordSeenRecFilter(channelKey, cur.recFilterInfo)
+    }
+
+    // Background pre-cache up to 10 upcoming recommendation videos onto disk for instant cold start
+    LaunchedEffect(
+        selectedChannelIdx,
+        pagerState.currentPage,
+        feedItems,
+        settings.preloadNextEpisode,
+        settings.wifiOnlyPreload,
+        settings.quality,
+        settings.cellularAutoLowQuality
+    ) {
+        if (selectedChannelIdx == 0 && feedItems.isNotEmpty()) {
+            val upcomingCandidates = feedItems.drop((pagerState.currentPage + 1).coerceAtMost(feedItems.size))
+            container.mediaCache.scheduleWarmFeedPrecache(
+                candidates = upcomingCandidates,
+                settings = settings,
+                localStore = container.localStore,
+                excludedIds = sessionExcludedIds
+            )
+        }
     }
 
     // Resolve current page's detail & playable video, plus preload next drama's episode

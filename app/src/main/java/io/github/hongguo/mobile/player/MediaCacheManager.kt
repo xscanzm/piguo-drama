@@ -17,16 +17,21 @@ import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import io.github.hongguo.mobile.core.ByteHelpers
+import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.HongguoApiClient
+import io.github.hongguo.mobile.core.LocalStore
 import io.github.hongguo.mobile.core.Mp4CencDecryptor
 import io.github.hongguo.mobile.core.PlayVariant
 import io.github.hongguo.mobile.core.QualityPreference
 import io.github.hongguo.mobile.core.UserSettings
+import io.github.hongguo.mobile.core.WarmFeedEntry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -49,8 +54,15 @@ data class ResolvedMediaSource(
 class MediaCacheManager(
     context: Context,
     private val api: HongguoApiClient,
-    private val httpClient: OkHttpClient
+    private val httpClient: OkHttpClient,
+    private val protectedCacheFilenamesProvider: () -> Set<String> = { emptySet() }
 ) {
+    private data class WarmPrecachePlan(
+        val candidates: List<DramaSummary>,
+        val settings: UserSettings,
+        val excludedIds: Set<String>
+    )
+
     private val appContext = context.applicationContext
     private val cacheDir = File(appContext.cacheDir, "episodes_mp4").apply { mkdirs() }
     private val streamCacheDir = File(appContext.cacheDir, "media_stream_cache").apply { mkdirs() }
@@ -65,10 +77,14 @@ class MediaCacheManager(
     private val inflight = ConcurrentHashMap<String, CompletableDeferred<ResolvedMediaSource>>()
     private val resolvedSourceCache = ConcurrentHashMap<String, Pair<Long, ResolvedMediaSource>>()
     private val activePreloads = ConcurrentHashMap.newKeySet<String>()
+    private val warmWorkerMutex = Mutex()
+    private val warmFailedSeriesIds = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var latestWarmPlan: WarmPrecachePlan? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        private const val MAX_DECRYPTED_BYTES = 250L * 1024L * 1024L
+        private const val MAX_DECRYPTED_BYTES = 300L * 1024L * 1024L
         private const val MAX_STREAM_CACHE_BYTES = 200L * 1024L * 1024L
         private const val MAX_EPISODE_BYTES = 256L * 1024L * 1024L
         private const val RESOLVED_SOURCE_TTL_MS = 300_000L
@@ -77,7 +93,32 @@ class MediaCacheManager(
     }
 
     private fun cacheFile(vid: String, quality: QualityPreference): File =
-        File(cacheDir, "${vid}_${quality.key}.mp4")
+        cacheFileByKey(vid, quality.key)
+
+    private fun cacheFileByKey(vid: String, qualityKey: String): File =
+        File(cacheDir, "${vid}_${qualityKey}.mp4")
+
+    fun hasLocalFile(vid: String, qualityKey: String): Boolean {
+        if (vid.isBlank()) return false
+        val cached = cacheFileByKey(vid, qualityKey)
+        return cached.exists() && cached.length() > 1024L
+    }
+
+    fun peekLocalFileSource(vid: String, qualityKey: String): ResolvedMediaSource? {
+        if (vid.isBlank()) return null
+        val cached = cacheFileByKey(vid, qualityKey)
+        if (!cached.exists() || cached.length() <= 1024L) return null
+        cached.setLastModified(System.currentTimeMillis())
+        val label = QualityPreference.entries.firstOrNull { it.key == qualityKey }?.label ?: qualityKey
+        return ResolvedMediaSource(
+            uri = Uri.fromFile(cached),
+            userAgent = "",
+            qualityLabel = label,
+            codec = "cached",
+            isLocalFile = true,
+            cacheKey = "${vid}_${qualityKey}"
+        )
+    }
 
     fun peekResolvedSource(vid: String, quality: QualityPreference): ResolvedMediaSource? {
         val cached = cacheFile(vid, quality)
@@ -354,6 +395,190 @@ class MediaCacheManager(
         }
     }
 
+    suspend fun downloadToLocalCache(
+        vid: String,
+        quality: QualityPreference,
+        seriesId: String? = null
+    ): ResolvedMediaSource? {
+        peekLocalFileSource(vid, quality.key)?.let { return it }
+        val resolved = resolvePlayableSource(vid, quality, seriesId = seriesId)
+        if (resolved.isLocalFile) return resolved
+
+        val target = cacheFile(vid, quality)
+        val tmp = File(cacheDir, "${vid}_${quality.key}.dl.tmp")
+        val candidates = listOf(resolved) + resolved.fallbackSources
+        return withContext(Dispatchers.IO) {
+            try {
+                val dlClient = httpClient.newBuilder()
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(25, TimeUnit.SECONDS)
+                    .callTimeout(60, TimeUnit.SECONDS)
+                    .build()
+                for (cand in candidates) {
+                    if (cand.isLocalFile) return@withContext cand
+                    val ok = runCatching {
+                        val req = Request.Builder()
+                            .url(cand.uri.toString())
+                            .apply {
+                                if (cand.userAgent.isNotEmpty()) header("User-Agent", cand.userAgent)
+                                if (cand.referer.isNotEmpty()) header("Referer", cand.referer)
+                            }
+                            .get()
+                            .build()
+                        dlClient.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                            val body = resp.body ?: error("响应为空")
+                            val len = body.contentLength()
+                            if (len > MAX_EPISODE_BYTES) error("单集文件过大")
+                            var total = 0L
+                            body.byteStream().use { input ->
+                                tmp.outputStream().use { output ->
+                                    val buf = ByteArray(16 * 1024)
+                                    while (true) {
+                                        val n = input.read(buf)
+                                        if (n <= 0) break
+                                        total += n
+                                        if (total > MAX_EPISODE_BYTES) error("单集文件超过大小限制")
+                                        output.write(buf, 0, n)
+                                    }
+                                }
+                            }
+                            if (total <= 8 * 1024L) error("缓存体积异常")
+                        }
+                        true
+                    }.getOrDefault(false)
+                    if (ok) {
+                        if (target.exists()) target.delete()
+                        if (!tmp.renameTo(target)) {
+                            tmp.copyTo(target, overwrite = true)
+                            tmp.delete()
+                        }
+                        target.setLastModified(System.currentTimeMillis())
+                        evictIfNeeded()
+                        return@withContext peekLocalFileSource(vid, quality.key)
+                    } else if (tmp.exists()) {
+                        tmp.delete()
+                    }
+                }
+                null
+            } finally {
+                if (tmp.exists()) tmp.delete()
+            }
+        }
+    }
+
+    fun scheduleWarmFeedPrecache(
+        candidates: List<DramaSummary>,
+        settings: UserSettings,
+        localStore: LocalStore,
+        excludedIds: Set<String>
+    ) {
+        latestWarmPlan = WarmPrecachePlan(
+            candidates = candidates,
+            settings = settings,
+            excludedIds = excludedIds
+        )
+        if (!settings.preloadNextEpisode || (settings.wifiOnlyPreload && !isOnWifi())) return
+
+        scope.launch {
+            if (!warmWorkerMutex.tryLock()) return@launch
+            try {
+                val extraFetched = ArrayList<DramaSummary>()
+                var extraFetchAttempts = 0
+                for (step in 0 until 16) {
+                    val plan = latestWarmPlan ?: break
+                    if (!plan.settings.preloadNextEpisode || (plan.settings.wifiOnlyPreload && !isOnWifi())) {
+                        break
+                    }
+                    val targetCount = if (isOnWifi()) 10 else 3
+                    val combinedExcluded = buildSet {
+                        addAll(plan.excludedIds)
+                        addAll(localStore.seenSeriesIdsSnapshot())
+                        addAll(localStore.feedPreferences.value.dislikedSeriesIds)
+                        for (h in localStore.history.value) add(h.seriesId)
+                        for (f in localStore.favorites.value) add(f.seriesId)
+                    }
+                    val validWarm = localStore.pruneWarmFeedEntries(combinedExcluded) { entry ->
+                        hasLocalFile(entry.vid, entry.qualityKey)
+                    }
+                    if (validWarm.size >= targetCount) break
+
+                    val warmIds = validWarm.mapTo(HashSet()) { it.summary.seriesId }
+                    val pool = plan.candidates + extraFetched
+                    var nextCandidate = pool.firstOrNull { cand ->
+                        cand.seriesId !in combinedExcluded &&
+                            cand.seriesId !in warmIds &&
+                            cand.seriesId !in warmFailedSeriesIds
+                    }
+                    if (nextCandidate == null && extraFetchAttempts < 2) {
+                        val pageToFetch = 2 + extraFetchAttempts
+                        extraFetchAttempts++
+                        val fetched = runCatching {
+                            api.fetchRecommendFeed("hot-drama", page = pageToFetch, forceRefresh = false)
+                        }.getOrNull()?.items.orEmpty()
+                        val existing = pool.mapTo(HashSet()) { it.seriesId }
+                        for (item in fetched) {
+                            if (existing.add(item.seriesId)) extraFetched.add(item)
+                        }
+                        nextCandidate = extraFetched.firstOrNull { cand ->
+                            cand.seriesId !in combinedExcluded &&
+                                cand.seriesId !in warmIds &&
+                                cand.seriesId !in warmFailedSeriesIds
+                        }
+                    }
+                    val candidate = nextCandidate ?: break
+
+                    val quality = effectiveQuality(plan.settings)
+                    var detail = api.peekSeriesDetail(candidate.seriesId)
+                    val vid = candidate.initialVid.ifBlank {
+                        if (detail == null) {
+                            detail = runCatching { api.fetchSeriesDetail(candidate.seriesId) }.getOrNull()
+                        }
+                        detail?.episodes?.getOrNull((candidate.initialEpisodeIndex - 1).coerceAtLeast(0))?.vid
+                            ?: detail?.episodes?.firstOrNull()?.vid
+                            ?: ""
+                    }
+                    if (vid.isBlank()) {
+                        warmFailedSeriesIds.add(candidate.seriesId)
+                        continue
+                    }
+
+                    val cachedMedia = runCatching {
+                        downloadToLocalCache(vid = vid, quality = quality, seriesId = candidate.seriesId)
+                    }.getOrNull()
+                    if (cachedMedia == null) {
+                        warmFailedSeriesIds.add(candidate.seriesId)
+                        delay(500L)
+                        continue
+                    }
+
+                    if (detail == null) {
+                        detail = runCatching { api.fetchSeriesDetail(candidate.seriesId) }.getOrNull()
+                    }
+                    val epIdx = detail?.episodes?.firstOrNull { it.vid == vid }?.index
+                        ?: candidate.initialEpisodeIndex
+
+                    if (candidate.seriesId !in localStore.seenSeriesIdsSnapshot() &&
+                        candidate.seriesId !in localStore.feedPreferences.value.dislikedSeriesIds
+                    ) {
+                        localStore.upsertWarmFeedEntry(
+                            WarmFeedEntry(
+                                summary = candidate,
+                                detail = detail,
+                                vid = vid,
+                                episodeIndex = epIdx,
+                                qualityKey = quality.key
+                            )
+                        )
+                    }
+                    delay(800L)
+                }
+            } finally {
+                warmWorkerMutex.unlock()
+            }
+        }
+    }
+
     fun getCacheSizeBytes(): Long {
         val decryptedBytes = cacheDir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
         val streamBytes = runCatching { streamCache.cacheSpace }.getOrDefault(0L)
@@ -363,6 +588,7 @@ class MediaCacheManager(
     fun clearAllCache() {
         cacheDir.listFiles()?.forEach { if (it.isFile) it.delete() }
         resolvedSourceCache.clear()
+        warmFailedSeriesIds.clear()
         runCatching {
             for (k in streamCache.keys.toList()) {
                 runCatching { streamCache.removeResource(k) }
@@ -376,7 +602,11 @@ class MediaCacheManager(
             ?.sortedBy { it.lastModified() }
             ?: return
         var total = files.sumOf { it.length() }
-        for (f in files) {
+        if (total <= MAX_DECRYPTED_BYTES) return
+
+        val protectedNames = protectedCacheFilenamesProvider()
+        val (protectedFiles, regularFiles) = files.partition { it.name in protectedNames }
+        for (f in regularFiles + protectedFiles) {
             if (total <= MAX_DECRYPTED_BYTES) break
             val sz = f.length()
             if (f.delete()) total -= sz
