@@ -189,7 +189,8 @@ data class UserSettings(
     val wifiOnlyPreload: Boolean = false,
     val cellularAutoLowQuality: Boolean = false,
     val feedQualityFilter: String = "all",
-    val fitModeFill: Boolean = true,
+    val fitModeFill: Boolean = false,
+    val fitModeUserChosen: Boolean = false,
     val backgroundAudioPlay: Boolean = false
 )
 

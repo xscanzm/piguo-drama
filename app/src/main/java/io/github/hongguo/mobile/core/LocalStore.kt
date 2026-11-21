@@ -66,7 +66,12 @@ class LocalStore(context: Context) {
     private fun loadSettings(): UserSettings {
         if (!settingsFile.exists()) return UserSettings()
         return runCatching {
-            json.decodeFromString<UserSettings>(settingsFile.readText(StandardCharsets.UTF_8))
+            val loaded = json.decodeFromString<UserSettings>(settingsFile.readText(StandardCharsets.UTF_8))
+            if (!loaded.fitModeUserChosen && loaded.fitModeFill) {
+                loaded.copy(fitModeFill = false)
+            } else {
+                loaded
+            }
         }.getOrDefault(UserSettings())
     }
 

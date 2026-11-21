@@ -732,8 +732,9 @@ fun HomeFeedScreen(
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(20.dp))
-                                    .background(CoralRed.copy(alpha = 0.92f))
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .background(Color(0xFF1A1A20).copy(alpha = 0.72f))
+                                    .border(0.8.dp, Color.White.copy(alpha = 0.20f), RoundedCornerShape(18.dp))
                                     .clickable {
                                         onOpenSeriesPlayer(
                                             drama.seriesId,
@@ -741,7 +742,7 @@ fun HomeFeedScreen(
                                             livePositions[drama.seriesId] ?: resumePos
                                         )
                                     }
-                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                                    .padding(horizontal = 12.dp, vertical = 6.dp)
                             ) {
                                 Text(
                                     text = if (totalEps > 0) {
@@ -749,16 +750,16 @@ fun HomeFeedScreen(
                                     } else {
                                         "进入全集连播"
                                     },
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    color = Color.White.copy(alpha = 0.94f),
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.Medium
                                 )
-                                Spacer(Modifier.width(4.dp))
+                                Spacer(Modifier.width(3.dp))
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                                     contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(18.dp)
+                                    tint = Color.White.copy(alpha = 0.78f),
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                         }
@@ -1044,7 +1045,9 @@ fun HomeFeedScreen(
             currentSpeed = settings.playbackSpeed,
             currentQuality = qualityPref,
             fitModeFill = settings.fitModeFill,
-            onSelectFitMode = { fill -> container.localStore.updateSettings { it.copy(fitModeFill = fill) } },
+            onSelectFitMode = { fill ->
+                container.localStore.updateSettings { it.copy(fitModeFill = fill, fitModeUserChosen = true) }
+            },
             sleepTimerState = sleepState,
             onSelectSleepTimer = { mode -> container.sleepTimer.setMode(mode) },
             backgroundAudioPlay = settings.backgroundAudioPlay,

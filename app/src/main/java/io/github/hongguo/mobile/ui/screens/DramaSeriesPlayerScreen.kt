@@ -454,31 +454,15 @@ fun DramaSeriesPlayerScreen(
                             )
                             Spacer(Modifier.height(6.dp))
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = loadedDetail.title,
-                                color = Color.White,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(CoralRed)
-                                    .padding(horizontal = 7.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    text = "第${ep.index}集",
-                                    color = Color.White,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
+                        Text(
+                            text = loadedDetail.title,
+                            color = Color.White,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                         if (loadedDetail.description.isNotEmpty()) {
                             Spacer(Modifier.height(5.dp))
                             Text(
@@ -635,7 +619,9 @@ fun DramaSeriesPlayerScreen(
             currentSpeed = settings.playbackSpeed,
             currentQuality = qualityPref,
             fitModeFill = settings.fitModeFill,
-            onSelectFitMode = { fill -> container.localStore.updateSettings { it.copy(fitModeFill = fill) } },
+            onSelectFitMode = { fill ->
+                container.localStore.updateSettings { it.copy(fitModeFill = fill, fitModeUserChosen = true) }
+            },
             sleepTimerState = sleepState,
             onSelectSleepTimer = { mode -> container.sleepTimer.setMode(mode) },
             backgroundAudioPlay = settings.backgroundAudioPlay,

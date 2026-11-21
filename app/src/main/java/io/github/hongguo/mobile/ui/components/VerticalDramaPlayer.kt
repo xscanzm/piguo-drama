@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -61,6 +62,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -87,6 +89,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import io.github.hongguo.mobile.core.computeVideoViewportSize
 import io.github.hongguo.mobile.player.ExoPlayerPool
 import io.github.hongguo.mobile.player.MediaCacheManager
 import io.github.hongguo.mobile.player.ResolvedMediaSource
@@ -109,7 +112,7 @@ fun VerticalDramaPlayer(
     playbackSpeed: Float,
     mediaCache: MediaCacheManager,
     playerPool: ExoPlayerPool,
-    fitModeFill: Boolean = true,
+    fitModeFill: Boolean = false,
     isInPipMode: Boolean = false,
     backgroundAudioPlay: Boolean = false,
     sleepTriggerCount: Int = 0,
@@ -255,10 +258,13 @@ fun VerticalDramaPlayer(
 
             override fun onVideoSizeChanged(size: VideoSize) {
                 if (size.width > 0 && size.height > 0) {
-                    videoWidth = size.width
-                    videoHeight = size.height
+                    val rotated = size.unappliedRotationDegrees == 90 || size.unappliedRotationDegrees == 270
+                    val effW = if (rotated) size.height else size.width
+                    val effH = if (rotated) size.width else size.height
+                    videoWidth = effW
+                    videoHeight = effH
                     videoPixelRatio = if (size.pixelWidthHeightRatio > 0f) size.pixelWidthHeightRatio else 1f
-                    latestOnVideoAspect(size.width, size.height)
+                    latestOnVideoAspect(effW, effH)
                 }
             }
 
@@ -341,11 +347,8 @@ fun VerticalDramaPlayer(
         onControlsVisibilityChange(controlsVisibleInFullscreen)
     }
 
-    val desiredResizeMode = if (isLandscapeVideo || isFullscreen || !fitModeFill) {
-        AspectRatioFrameLayout.RESIZE_MODE_FIT
-    } else {
-        AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-    }
+    val cropToFill = fitModeFill && !isLandscapeVideo && !isFullscreen
+    val desiredResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
     val shouldKeepScreenOn = isActive && (isPlaying || (isBuffering && !isUserPaused)) && playerError == null
 
     val latestControlsVisible by rememberUpdatedState(controlsVisibleInFullscreen)
@@ -356,6 +359,7 @@ fun VerticalDramaPlayer(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
+            .clipToBounds()
             .pointerInput(mediaSource, isActive, isFullscreen, isScreenLocked, isInPipMode) {
                 detectTapGestures(
                     onTap = {
@@ -397,23 +401,26 @@ fun VerticalDramaPlayer(
         val boxWpx = with(density) { containerW.toPx() }.coerceAtLeast(1f)
         val boxHpx = with(density) { containerH.toPx() }.coerceAtLeast(1f)
 
-        val playerViewModifier = if ((isLandscapeVideo || isFullscreen || !fitModeFill) && videoWidth > 0 && videoHeight > 0) {
-            val aspect = ((videoWidth * videoPixelRatio) / videoHeight.toFloat()).coerceAtLeast(0.1f)
-            val (viewWpx, viewHpx) = if (boxWpx / boxHpx > aspect) {
-                (boxHpx * aspect) to boxHpx
-            } else {
-                boxWpx to (boxWpx / aspect)
-            }
-            val boxW = with(density) { viewWpx.toDp() }
-            val boxH = with(density) { viewHpx.toDp() }
+        val playerViewModifier = if (videoWidth > 0 && videoHeight > 0) {
+            val vp = computeVideoViewportSize(
+                containerW = boxWpx,
+                containerH = boxHpx,
+                videoW = videoWidth,
+                videoH = videoHeight,
+                pixelRatio = videoPixelRatio,
+                cropToFill = cropToFill
+            )
+            val boxW = with(density) { vp.widthPx.toDp() }
+            val boxH = with(density) { vp.heightPx.toDp() }
             Modifier
                 .align(Alignment.Center)
-                .size(boxW, boxH)
+                .requiredSize(boxW, boxH)
         } else {
             Modifier.fillMaxSize()
         }
 
         if (mediaSource != null) {
+            val layoutKey = Triple(videoWidth, videoHeight, cropToFill)
             AndroidView(
                 factory = { ctx ->
                     val pv = LayoutInflater.from(ctx).inflate(R.layout.player_texture_view, null, false) as PlayerView
@@ -422,6 +429,7 @@ fun VerticalDramaPlayer(
                         useController = false
                         resizeMode = desiredResizeMode
                         keepScreenOn = shouldKeepScreenOn
+                        tag = layoutKey
                         layoutParams = FrameLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT
@@ -432,8 +440,15 @@ fun VerticalDramaPlayer(
                 update = { view ->
                     playerViewRef = view
                     if (view.player !== exoPlayer) view.player = exoPlayer
+                    var needRelayout = view.tag != layoutKey
+                    if (needRelayout) {
+                        view.tag = layoutKey
+                    }
                     if (view.resizeMode != desiredResizeMode) {
                         view.resizeMode = desiredResizeMode
+                        needRelayout = true
+                    }
+                    if (needRelayout) {
                         view.requestLayout()
                     }
                     if (view.keepScreenOn != shouldKeepScreenOn) view.keepScreenOn = shouldKeepScreenOn
@@ -550,7 +565,7 @@ fun VerticalDramaPlayer(
             AsyncImage(
                 model = coverUrl,
                 contentDescription = null,
-                contentScale = if (isFullscreen) ContentScale.Fit else ContentScale.Crop,
+                contentScale = if (cropToFill) ContentScale.Crop else ContentScale.Fit,
                 modifier = Modifier.fillMaxSize()
             )
             Box(

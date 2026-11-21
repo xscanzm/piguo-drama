@@ -286,7 +286,7 @@ fun EpisodePickerSheet(
 fun SpeedQualitySheet(
     currentSpeed: Float,
     currentQuality: QualityPreference,
-    fitModeFill: Boolean = true,
+    fitModeFill: Boolean = false,
     onSelectFitMode: (Boolean) -> Unit = {},
     sleepTimerState: SleepTimerState = SleepTimerState(),
     onSelectSleepTimer: (SleepTimerMode) -> Unit = {},
@@ -379,7 +379,7 @@ fun SpeedQualitySheet(
             Text("画面比例（竖屏模式）", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                listOf(true to "铺满画面", false to "完整不裁边").forEach { (fillVal, title) ->
+                listOf(false to "原比例（不裁边）", true to "等比铺满（裁左右）").forEach { (fillVal, title) ->
                     val selected = fitModeFill == fillVal
                     Box(
                         contentAlignment = Alignment.Center,

@@ -171,4 +171,42 @@ class FeedAndHistoryTest {
         apiClient.clearDislikedRecFilters()
         assertEquals("", apiClient.buildRecFilterListJson("hot-drama"))
     }
+
+    @Test
+    fun videoViewportPreservesAspectRatioInFitAndCropModes() {
+        // 9:16 portrait video (1080x1920) inside 20:9 phone container (1440x2950)
+        val fitPortrait = computeVideoViewportSize(
+            containerW = 1440f,
+            containerH = 2950f,
+            videoW = 1080,
+            videoH = 1920,
+            pixelRatio = 1f,
+            cropToFill = false
+        )
+        assertEquals(1440f, fitPortrait.widthPx, 0.5f)
+        assertEquals(2560f, fitPortrait.heightPx, 0.5f)
+
+        val cropPortrait = computeVideoViewportSize(
+            containerW = 1440f,
+            containerH = 2950f,
+            videoW = 1080,
+            videoH = 1920,
+            pixelRatio = 1f,
+            cropToFill = true
+        )
+        assertEquals(2950f, cropPortrait.heightPx, 0.5f)
+        assertEquals(2950f * (1080f / 1920f), cropPortrait.widthPx, 0.5f)
+
+        // 16:9 landscape video (1920x1080) inside 20:9 phone container (1440x2950)
+        val fitLandscape = computeVideoViewportSize(
+            containerW = 1440f,
+            containerH = 2950f,
+            videoW = 1920,
+            videoH = 1080,
+            pixelRatio = 1f,
+            cropToFill = false
+        )
+        assertEquals(1440f, fitLandscape.widthPx, 0.5f)
+        assertEquals(810f, fitLandscape.heightPx, 0.5f)
+    }
 }
