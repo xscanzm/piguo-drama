@@ -15,6 +15,12 @@ const val GITHUB_REPO = "xscanzm/piguo-drama"
 const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
 const val LATEST_RELEASE_PAGE_URL = "https://github.com/$GITHUB_REPO/releases/latest"
 
+val GITHUB_MIRROR_CHANNELS: List<Pair<String, String>> = listOf(
+    "加速线路 1" to "https://gh-proxy.org/",
+    "加速线路 2" to "https://ghfast.top/",
+    "加速线路 3" to "https://v6.gh-proxy.com/"
+)
+
 @Serializable
 data class AppUpdateInfo(
     val tagName: String,
@@ -28,7 +34,20 @@ data class AppUpdateInfo(
 )
 
 object AppUpdateChecker {
-    private val TAG_PATH_REGEX = Regex("/releases/tag/([^/?#]+)")
+    private val TAG_PATH_REGEX = Regex("/releases/tag/([^/?#\"'\\s<>]+)")
+
+    fun buildDownloadCandidates(downloadUrl: String): List<Pair<String, String>> {
+        val clean = downloadUrl.trim()
+        if (clean.isEmpty()) return emptyList()
+        val list = ArrayList<Pair<String, String>>(1 + GITHUB_MIRROR_CHANNELS.size)
+        list.add("GitHub 直连" to clean)
+        if (clean.startsWith("https://github.com/")) {
+            for ((label, prefix) in GITHUB_MIRROR_CHANNELS) {
+                list.add(label to "$prefix$clean")
+            }
+        }
+        return list
+    }
 
     fun normalizeVersion(raw: String): String {
         return raw.trim()
@@ -151,9 +170,14 @@ object AppUpdateChecker {
         )
     }
 
+    fun parseTagFromHtmlOrUrl(text: String): AppUpdateInfo? =
+        parseRedirectLocationToRelease(text)
+
     suspend fun fetchLatestRelease(httpClient: OkHttpClient): AppUpdateInfo = withContext(Dispatchers.IO) {
         val apiClient = httpClient.newBuilder()
-            .callTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(6, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
             .build()
         var lastError: Exception? = null
 
@@ -180,7 +204,9 @@ object AppUpdateChecker {
         runCatching {
             val redirectClient = httpClient.newBuilder()
                 .followRedirects(false)
-                .callTimeout(10, TimeUnit.SECONDS)
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(6, TimeUnit.SECONDS)
+                .callTimeout(7, TimeUnit.SECONDS)
                 .build()
             val req = Request.Builder()
                 .url(LATEST_RELEASE_PAGE_URL)
@@ -194,6 +220,32 @@ object AppUpdateChecker {
                 error("跳转定位最新版本失败 (HTTP ${resp.code})")
             }
         }.onFailure { if (it is Exception) lastError = it }
+
+        // Mirror fallbacks for restricted networks where GitHub direct times out
+        for ((_, prefix) in GITHUB_MIRROR_CHANNELS) {
+            runCatching {
+                val mirrorClient = httpClient.newBuilder()
+                    .followRedirects(false)
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(6, TimeUnit.SECONDS)
+                    .callTimeout(7, TimeUnit.SECONDS)
+                    .build()
+                val req = Request.Builder()
+                    .url("$prefix$LATEST_RELEASE_PAGE_URL")
+                    .header("User-Agent", "PiguoDrama-Android")
+                    .get()
+                    .build()
+                mirrorClient.newCall(req).execute().use { resp ->
+                    val loc = resp.header("Location").orEmpty()
+                    parseTagFromHtmlOrUrl(loc)?.let { return@withContext it }
+                    if (resp.code in 200..299) {
+                        val html = resp.body?.string().orEmpty().take(128_000)
+                        parseTagFromHtmlOrUrl(html)?.let { return@withContext it }
+                    }
+                    error("镜像检查版本失败 (HTTP ${resp.code})")
+                }
+            }.onFailure { if (it is Exception) lastError = it }
+        }
 
         throw (lastError ?: IllegalStateException("检查更新失败，请检查网络连接"))
     }

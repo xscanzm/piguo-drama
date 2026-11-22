@@ -113,6 +113,25 @@ class AppUpdateAndWarmCacheTest {
         assertEquals("https://github.com/xscanzm/piguo-drama/releases/tag/v1.4.0", relative.htmlUrl)
 
         assertNull(AppUpdateChecker.parseRedirectLocationToRelease("https://github.com/xscanzm/piguo-drama"))
+
+        val htmlMatch = AppUpdateChecker.parseTagFromHtmlOrUrl(
+            """<a href="https://github.com/xscanzm/piguo-drama/releases/tag/v1.3.2">v1.3.2</a>"""
+        )
+        assertNotNull(htmlMatch)
+        assertEquals("v1.3.2", htmlMatch!!.tagName)
+        assertEquals("1.3.2", htmlMatch.versionName)
+    }
+
+    @Test
+    fun buildDownloadCandidatesIncludesDirectAndMirrorsForGithubOnly() {
+        val ghUrl = "https://github.com/xscanzm/piguo-drama/releases/download/v1.2.1/app-release.apk"
+        val candidates = AppUpdateChecker.buildDownloadCandidates(ghUrl)
+        assertEquals(1 + GITHUB_MIRROR_CHANNELS.size, candidates.size)
+        assertEquals("GitHub 直连" to ghUrl, candidates[0])
+        assertEquals("https://gh-proxy.org/$ghUrl", candidates[1].second)
+
+        val cdnUrl = "https://cdn.example.com/app-release.apk"
+        assertEquals(listOf("GitHub 直连" to cdnUrl), AppUpdateChecker.buildDownloadCandidates(cdnUrl))
     }
 
     @Test

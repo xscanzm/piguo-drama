@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items as rowItems
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -32,6 +33,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -138,8 +140,16 @@ fun EpisodePickerSheet(
             }
 
             if (seasons.size >= 2 && onSwitchSeason != null) {
+                val seasonRowState = rememberLazyListState()
+                LaunchedEffect(seasons) {
+                    val curIdx = seasons.indexOfFirst { it.isCurrent }
+                    if (curIdx >= 0) {
+                        seasonRowState.animateScrollToItem(curIdx)
+                    }
+                }
                 Spacer(Modifier.height(10.dp))
                 LazyRow(
+                    state = seasonRowState,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {

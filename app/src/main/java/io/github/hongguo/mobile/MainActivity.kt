@@ -68,6 +68,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        (application as HongguoApp).container.updateManager.resumePendingInstallIfAllowed(this)
+    }
+
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         (application as HongguoApp).container.isInPipMode.value = isInPictureInPictureMode
@@ -93,7 +98,18 @@ private fun HongguoRootApp(container: AppContainer) {
     var feedFullscreen by remember { mutableStateOf(false) }
     val showBottomBar = !inPip && MainTab.entries.any { it.route == currentRoute } && !(currentRoute == MainTab.HOME.route && feedFullscreen)
     var searchFocusTrigger by remember { mutableIntStateOf(0) }
+    var pendingSearchKeyword by remember { mutableStateOf<String?>(null) }
     var homeRefreshTrigger by remember { mutableIntStateOf(0) }
+
+    fun openTheaterSearch(keyword: String? = null) {
+        pendingSearchKeyword = keyword?.trim()?.takeIf { it.isNotEmpty() }
+        searchFocusTrigger++
+        navController.navigate(MainTab.THEATER.route) {
+            popUpTo(MainTab.HOME.route) { saveState = true }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
 
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(2_500L)
@@ -177,20 +193,15 @@ private fun HongguoRootApp(container: AppContainer) {
                         onOpenSeriesPlayer = { id, ep, pos ->
                             navController.navigate("player/$id?episode=$ep&pos=$pos")
                         },
-                        onOpenSearch = {
-                            searchFocusTrigger++
-                            navController.navigate(MainTab.THEATER.route) {
-                                popUpTo(MainTab.HOME.route) { saveState = true }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        }
+                        onOpenSearch = { kw -> openTheaterSearch(kw) }
                     )
                 }
                 composable(MainTab.THEATER.route) {
                     TheaterScreen(
                         container = container,
                         focusSearchTrigger = searchFocusTrigger,
+                        initialSearchKeyword = pendingSearchKeyword,
+                        onConsumeInitialSearchKeyword = { pendingSearchKeyword = null },
                         onOpenSeries = { id -> openSeriesPlayer(id) }
                     )
                 }
@@ -222,7 +233,8 @@ private fun HongguoRootApp(container: AppContainer) {
                         initialEpisodeIndex = ep,
                         initialPositionMs = pos,
                         onBack = { navController.popBackStack() },
-                        onSwitchSeries = { targetId -> openSeriesPlayer(targetId, replaceCurrent = true) }
+                        onSwitchSeries = { targetId -> openSeriesPlayer(targetId, replaceCurrent = true) },
+                        onSearchAll = { kw -> openTheaterSearch(kw) }
                     )
                 }
             }
@@ -234,6 +246,7 @@ private fun HongguoRootApp(container: AppContainer) {
             status = updateStatus,
             onDismiss = { skip -> container.updateManager.dismissUpdateDialog(skipInSession = skip) },
             onStartDownload = { info -> container.updateManager.startDownloadAndInstall(info, context) },
+            onCancelDownload = { container.updateManager.cancelDownload() },
             onTriggerInstall = { ready -> container.updateManager.triggerInstall(context, ready.apkFile, ready.info) },
             onOpenBrowser = { url -> container.updateManager.openReleasePageInBrowser(context, url) }
         )

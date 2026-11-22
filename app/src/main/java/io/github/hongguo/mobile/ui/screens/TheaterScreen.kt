@@ -81,6 +81,8 @@ import kotlinx.coroutines.launch
 fun TheaterScreen(
     container: AppContainer,
     focusSearchTrigger: Int,
+    initialSearchKeyword: String? = null,
+    onConsumeInitialSearchKeyword: () -> Unit = {},
     onOpenSeries: (seriesId: String) -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -168,6 +170,20 @@ fun TheaterScreen(
             loadCatalog(reset = true)
         } else {
             executeSearch(reset = true)
+        }
+    }
+
+    LaunchedEffect(focusSearchTrigger, initialSearchKeyword) {
+        val kw = initialSearchKeyword?.trim()
+        if (!kw.isNullOrEmpty()) {
+            searchQuery = kw
+            searchCursor = null
+            if (activeSearchKeyword == kw) {
+                executeSearch(reset = true)
+            } else {
+                activeSearchKeyword = kw
+            }
+            onConsumeInitialSearchKeyword()
         }
     }
 

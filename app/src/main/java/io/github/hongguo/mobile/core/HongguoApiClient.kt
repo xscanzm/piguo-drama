@@ -79,7 +79,6 @@ class HongguoApiClient(
     private val prefetchedVariantsCache = ConcurrentHashMap<String, Pair<Long, List<PlayVariant>>>()
     private val catalogGenres = ConcurrentHashMap<String, List<GenreItem>>()
     private val detailCache = ConcurrentHashMap<String, Pair<Long, DramaDetail>>()
-    private val seasonSearchCache = ConcurrentHashMap<String, Pair<Long, List<DramaSummary>>>()
 
     private fun currentCookieHeader(): String? =
         authSessionProvider()?.cookieHeader?.takeIf { it.isNotBlank() }
@@ -1151,6 +1150,121 @@ class HongguoApiClient(
         return null
     }
 
+    private fun parseSearchVideoItem(
+        video: JSONObject,
+        fallbackTitle: String = "",
+        fallbackDesc: String = ""
+    ): DramaSummary? {
+        val sid = video.optString("series_id").trim()
+        if (!Regex("^\\d{6,30}$").matches(sid)) return null
+        if (video.optBoolean("disable_play", false)) return null
+        val epCnt = video.optInt("episode_cnt", video.optInt("episode_count", 0))
+        if (epCnt <= 0) return null
+        val title = cleanTitle(
+            video.optString("title")
+                .ifBlank { video.optString("series_name") }
+                .ifBlank { fallbackTitle }
+        )
+        if (title.isEmpty()) return null
+        val cover = compatibleCover(video.optString("cover").ifBlank { video.optString("series_cover") })
+        val desc = cleanTitle(
+            video.optString("series_intro")
+                .ifBlank { video.optString("video_desc") }
+                .ifBlank { fallbackDesc }
+        )
+        val detailObj = video.optJSONObject("video_detail")
+        val followedCnt = video.optLong("followed_cnt", 0L)
+            .takeIf { it > 0L }
+            ?: detailObj?.optLong("followed_cnt", 0L)
+            ?: 0L
+        val playCnt = video.optLong("play_cnt", 0L)
+            .takeIf { it > 0L }
+            ?: detailObj?.optLong("series_play_cnt", 0L)
+            ?: 0L
+        return DramaSummary(
+            seriesId = sid,
+            title = title,
+            cover = cover,
+            episodeCount = epCnt,
+            description = desc,
+            followedCount = followedCnt,
+            seriesPlayCount = playCnt
+        )
+    }
+
+    internal fun parseAppSearchTab(tab: JSONObject, page: Int): SearchPageResult {
+        val cells = tab.optJSONArray("data") ?: JSONArray()
+        val seen = HashSet<String>()
+        val items = ArrayList<DramaSummary>()
+        val officialSeriesIds = LinkedHashSet<String>()
+        val officialOtherVersionIds = LinkedHashSet<String>()
+
+        for (i in 0 until cells.length()) {
+            val cell = cells.optJSONObject(i) ?: continue
+            val hlTitle = cell.optJSONObject("search_high_light")?.optJSONObject("title")?.optString("text")
+            val cellFallbackTitle = hlTitle?.takeIf { it.isNotBlank() } ?: cell.optString("cell_name")
+            val cellFallbackDesc = cell.optString("series_intro")
+
+            val vArr = cell.optJSONArray("video_data")
+            if (vArr != null) {
+                for (j in 0 until vArr.length()) {
+                    val candidate = vArr.optJSONObject(j) ?: continue
+                    val parsed = parseSearchVideoItem(
+                        video = candidate,
+                        fallbackTitle = if (j == 0) cellFallbackTitle else "",
+                        fallbackDesc = if (j == 0) cellFallbackDesc else ""
+                    ) ?: continue
+                    if (seen.add(parsed.seriesId)) {
+                        items.add(parsed)
+                    }
+                }
+            }
+
+            val lynxRaw = cell.optString("lynx_data", "")
+            if (lynxRaw.isNotBlank()) {
+                val preservedLynx = Regex("(\"(?:series_id|vid)\"\\s*:\\s*)(-?\\d{6,})(?=\\s*[,}\\]])")
+                    .replace(lynxRaw, "$1\"$2\"")
+                val lynxObj = runCatching { JSONObject(preservedLynx) }.getOrNull() ?: continue
+                val lynxName = lynxObj.optString("cell_name", cell.optString("cell_name"))
+                val lynxUrl = lynxObj.optString("cell_url", cell.optString("cell_url"))
+                val isOfficialSeries = lynxName.contains("系列") || lynxUrl.contains("same_ip_same_series")
+                val isOfficialOtherVersion = lynxName.contains("其他版本") || lynxUrl.contains("same_ip_diff_series")
+                val cellDataArr = lynxObj.optJSONArray("cell_data") ?: continue
+                for (k in 0 until cellDataArr.length()) {
+                    val sub = cellDataArr.optJSONObject(k) ?: continue
+                    val subVideos = sub.optJSONArray("video_data") ?: continue
+                    for (m in 0 until subVideos.length()) {
+                        val candidate = subVideos.optJSONObject(m) ?: continue
+                        val parsed = parseSearchVideoItem(candidate) ?: continue
+                        if (isOfficialSeries) {
+                            officialSeriesIds.add(parsed.seriesId)
+                        } else if (isOfficialOtherVersion) {
+                            officialOtherVersionIds.add(parsed.seriesId)
+                        }
+                        if (seen.add(parsed.seriesId)) {
+                            items.add(parsed)
+                        }
+                    }
+                }
+            }
+        }
+
+        val hasMore = tab.optBoolean("has_more", false) && page < 50
+        val nextCursor = SearchCursor(
+            searchId = tab.optString("search_id", ""),
+            passback = tab.optString("passback", ""),
+            nextOffset = if (tab.has("next_offset")) tab.optInt("next_offset") else null
+        )
+        return SearchPageResult(
+            items = items,
+            page = page,
+            hasMore = hasMore,
+            cursor = nextCursor,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
+    }
+
     suspend fun searchDramas(
         keyword: String,
         page: Int = 1,
@@ -1187,44 +1301,7 @@ class HongguoApiClient(
                 }
             }
             val tab = targetTab ?: error("未找到短剧搜索结果")
-            val cells = tab.optJSONArray("data") ?: JSONArray()
-            val seen = HashSet<String>()
-            val items = ArrayList<DramaSummary>()
-            for (i in 0 until cells.length()) {
-                val cell = cells.optJSONObject(i) ?: continue
-                val vArr = cell.optJSONArray("video_data") ?: continue
-                var video: JSONObject? = null
-                for (j in 0 until vArr.length()) {
-                    val candidate = vArr.optJSONObject(j) ?: continue
-                    if (Regex("^\\d{1,30}$").matches(candidate.optString("series_id"))) {
-                        video = candidate
-                        break
-                    }
-                }
-                if (video == null) continue
-                val sid = video.optString("series_id")
-                val hlTitle = cell.optJSONObject("search_high_light")?.optJSONObject("title")?.optString("text")
-                val title = cleanTitle(hlTitle ?: video.optString("title").ifEmpty { cell.optString("cell_name") })
-                if (title.isEmpty() || !seen.add(sid)) continue
-                items.add(
-                    DramaSummary(
-                        seriesId = sid,
-                        title = title,
-                        cover = compatibleCover(video.optString("cover")),
-                        episodeCount = video.optInt("episode_cnt", video.optInt("episode_count", 0)),
-                        description = cleanTitle(
-                            video.optString("series_intro").ifEmpty { video.optString("video_desc").ifEmpty { cell.optString("series_intro") } }
-                        )
-                    )
-                )
-            }
-            val hasMore = tab.optBoolean("has_more", false) && page < 50
-            val nextCursor = SearchCursor(
-                searchId = tab.optString("search_id", ""),
-                passback = tab.optString("passback", ""),
-                nextOffset = if (tab.has("next_offset")) tab.optInt("next_offset") else null
-            )
-            SearchPageResult(items = items, page = page, hasMore = hasMore, cursor = nextCursor)
+            parseAppSearchTab(tab, page)
         } catch (_: Exception) {
             searchWebsite(cleanKw, page)
         }
@@ -1241,6 +1318,10 @@ class HongguoApiClient(
         for (i in 0 until list.length()) {
             val item = list.optJSONObject(i) ?: continue
             val videoData = item.optJSONObject("video_data")?.takeIf { it.length() > 0 } ?: item
+            if (videoData.optBoolean("disable_play", false)) continue
+            val hasEpField = videoData.has("episode_cnt") || videoData.has("episode_count")
+            val epCnt = videoData.optInt("episode_cnt", videoData.optInt("episode_count", 0))
+            if (hasEpField && epCnt <= 0) continue
             val sid = videoData.optString("series_id").ifEmpty { item.optString("series_id") }.trim()
             val title = cleanTitle(
                 videoData.optString("series_name").ifEmpty { videoData.optString("series_title").ifEmpty { item.optString("name") } }
@@ -1251,15 +1332,15 @@ class HongguoApiClient(
                     seriesId = sid,
                     title = title,
                     cover = compatibleCover(videoData.optString("series_cover").ifEmpty { videoData.optString("cover") }),
-                    episodeCount = videoData.optInt("episode_cnt", 0),
+                    episodeCount = epCnt.coerceAtLeast(0),
                     description = cleanTitle(videoData.optString("series_intro"))
                 )
             )
         }
-        return SearchPageResult(items = items, page = page, hasMore = false, cursor = null)
+        return SearchPageResult(items = items, page = page, hasMore = items.size >= 8 && page < 10, cursor = null)
     }
 
-    // ---- Series Detail (Dual Web Race + App Preload Fallback) ----
+    // ---- Series Detail & Live Zero-Cache Related Dramas ----
 
     fun peekSeriesDetail(seriesId: String): DramaDetail? {
         val cached = detailCache[seriesId] ?: return null
@@ -1272,28 +1353,154 @@ class HongguoApiClient(
         }
     }
 
-    fun peekSeriesSeasons(current: DramaSummary): List<SeriesSeasonItem>? {
-        val parsed = SeriesSeasonMatcher.parseTitle(current.title)
-        if (parsed.normalizedBase.length < 2) return emptyList()
-        val cached = seasonSearchCache[parsed.normalizedBase] ?: return null
-        if (cached.first <= System.currentTimeMillis()) return null
-        return SeriesSeasonMatcher.matchAndSortSeasons(current, cached.second)
+    private fun mergeCandidates(
+        base: List<DramaSummary>,
+        incoming: List<DramaSummary>
+    ): List<DramaSummary> {
+        val map = LinkedHashMap<String, DramaSummary>()
+        for (item in base) {
+            if (item.seriesId.isNotBlank()) {
+                val prev = map[item.seriesId]
+                map[item.seriesId] = if (prev == null) item else SeriesSeasonMatcher.preferBetterSummary(prev, item)
+            }
+        }
+        for (item in incoming) {
+            if (item.seriesId.isNotBlank()) {
+                val prev = map[item.seriesId]
+                map[item.seriesId] = if (prev == null) item else SeriesSeasonMatcher.preferBetterSummary(prev, item)
+            }
+        }
+        return map.values.toList()
     }
 
-    suspend fun fetchSeriesSeasons(current: DramaSummary): List<SeriesSeasonItem> {
-        val parsed = SeriesSeasonMatcher.parseTitle(current.title)
-        if (parsed.normalizedBase.length < 2) return emptyList()
-        val cached = seasonSearchCache[parsed.normalizedBase]
-        if (cached != null && cached.first > System.currentTimeMillis()) {
-            return SeriesSeasonMatcher.matchAndSortSeasons(current, cached.second)
+    suspend fun fetchRelatedDramas(current: DramaSummary): RelatedDramaBundle = withContext(Dispatchers.IO) {
+        val keyword = SeriesSeasonMatcher.extractSearchKeyword(current.title)
+        if (keyword.isBlank() || SeriesSeasonMatcher.normalizeForMatch(keyword).length < 2) {
+            return@withContext RelatedDramaBundle(
+                keyword = current.title,
+                seasons = emptyList(),
+                related = emptyList()
+            )
         }
-        val results = runCatching {
-            searchDramas(keyword = parsed.baseTitle, page = 1).items
-        }.getOrElse {
-            return emptyList()
+
+        val appP1Job = async { runCatching { searchDramas(keyword = keyword, page = 1) } }
+        val webP1Job = async { runCatching { searchWebsite(keyword = keyword, page = 1) } }
+        val appP1Res = appP1Job.await()
+        val webP1Res = webP1Job.await()
+        val appP1 = appP1Res.getOrNull()
+        val webP1 = webP1Res.getOrNull()
+        if (appP1 == null && webP1 == null) {
+            throw (appP1Res.exceptionOrNull() ?: webP1Res.exceptionOrNull() ?: IllegalStateException("相关作品搜索失败"))
         }
-        seasonSearchCache[parsed.normalizedBase] = (System.currentTimeMillis() + 600_000L) to results
-        return SeriesSeasonMatcher.matchAndSortSeasons(current, results)
+
+        var merged = mergeCandidates(appP1?.items.orEmpty(), webP1?.items.orEmpty())
+        val officialSeriesIds = LinkedHashSet<String>().apply {
+            appP1?.officialSeriesIds?.let { addAll(it) }
+        }
+        val officialOtherVersionIds = LinkedHashSet<String>().apply {
+            appP1?.officialOtherVersionIds?.let { addAll(it) }
+        }
+
+        val initialClassified = SeriesSeasonMatcher.classifyRelatedDramas(
+            current = current,
+            searchCandidates = merged,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
+
+        var nextPage = 2
+        var hasMore = (appP1?.hasMore == true) || (webP1?.hasMore == true)
+        var cursor: SearchCursor? = appP1?.cursor
+
+        if (appP1 != null && appP1.hasMore && initialClassified.second.size < 6) {
+            val appP2 = runCatching {
+                searchDramas(keyword = keyword, page = 2, cursor = appP1.cursor)
+            }.getOrNull()
+            if (appP2 != null) {
+                merged = mergeCandidates(merged, appP2.items)
+                officialSeriesIds.addAll(appP2.officialSeriesIds)
+                officialOtherVersionIds.addAll(appP2.officialOtherVersionIds)
+                nextPage = 3
+                hasMore = appP2.hasMore
+                cursor = appP2.cursor
+            }
+        }
+
+        var finalClassified = SeriesSeasonMatcher.classifyRelatedDramas(
+            current = current,
+            searchCandidates = merged,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
+
+        if (finalClassified.first.size < 2) {
+            val shortPrefix = SeriesSeasonMatcher.extractShortPrefixKeyword(keyword)
+            if (shortPrefix != null) {
+                val extraWeb = runCatching { searchWebsite(keyword = shortPrefix, page = 1) }.getOrNull()
+                if (extraWeb != null && extraWeb.items.isNotEmpty()) {
+                    merged = mergeCandidates(merged, extraWeb.items)
+                    finalClassified = SeriesSeasonMatcher.classifyRelatedDramas(
+                        current = current,
+                        searchCandidates = merged,
+                        officialSeriesIds = officialSeriesIds,
+                        officialOtherVersionIds = officialOtherVersionIds
+                    )
+                }
+            }
+        }
+
+        RelatedDramaBundle(
+            keyword = keyword,
+            seasons = finalClassified.first,
+            related = finalClassified.second,
+            nextPage = nextPage,
+            hasMore = hasMore,
+            cursor = cursor,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
+    }
+
+    suspend fun fetchMoreRelatedDramas(
+        current: DramaSummary,
+        bundle: RelatedDramaBundle
+    ): RelatedDramaBundle = withContext(Dispatchers.IO) {
+        if (!bundle.hasMore || bundle.keyword.isBlank()) return@withContext bundle
+
+        val pageRes = if (bundle.cursor != null) {
+            searchDramas(keyword = bundle.keyword, page = bundle.nextPage, cursor = bundle.cursor)
+        } else {
+            searchWebsite(keyword = bundle.keyword, page = bundle.nextPage)
+        }
+
+        val existing = bundle.seasons.map { it.summary } + bundle.related.map { it.summary }
+        val existingIds = existing.mapTo(HashSet()) { it.seriesId }
+        val newUniqueCount = pageRes.items.count { it.seriesId !in existingIds }
+        val merged = mergeCandidates(existing, pageRes.items)
+        val officialSeriesIds = (bundle.officialSeriesIds + pageRes.officialSeriesIds)
+        val officialOtherVersionIds = (bundle.officialOtherVersionIds + pageRes.officialOtherVersionIds)
+
+        val classified = SeriesSeasonMatcher.classifyRelatedDramas(
+            current = current,
+            searchCandidates = merged,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
+        val moreAvailable = if (pageRes.cursor != null) {
+            pageRes.hasMore
+        } else {
+            pageRes.hasMore && newUniqueCount > 0
+        }
+
+        bundle.copy(
+            seasons = classified.first,
+            related = classified.second,
+            nextPage = bundle.nextPage + 1,
+            hasMore = moreAvailable,
+            cursor = pageRes.cursor,
+            officialSeriesIds = officialSeriesIds,
+            officialOtherVersionIds = officialOtherVersionIds
+        )
     }
 
     suspend fun fetchSeriesDetail(seriesId: String, forceRefresh: Boolean = false): DramaDetail = withContext(Dispatchers.IO) {

@@ -112,7 +112,9 @@ data class SearchPageResult(
     val items: List<DramaSummary>,
     val page: Int,
     val hasMore: Boolean,
-    val cursor: SearchCursor? = null
+    val cursor: SearchCursor? = null,
+    val officialSeriesIds: Set<String> = emptySet(),
+    val officialOtherVersionIds: Set<String> = emptySet()
 )
 
 @Serializable

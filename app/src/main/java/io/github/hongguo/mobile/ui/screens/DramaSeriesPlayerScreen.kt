@@ -68,7 +68,8 @@ import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.QualityPreference
-import io.github.hongguo.mobile.core.SeriesSeasonItem
+import io.github.hongguo.mobile.core.RelatedDramaBundle
+import io.github.hongguo.mobile.core.SeriesSeasonMatcher
 import io.github.hongguo.mobile.core.shouldRecordWatchHistory
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
@@ -98,7 +99,8 @@ fun DramaSeriesPlayerScreen(
     initialEpisodeIndex: Int,
     initialPositionMs: Long,
     onBack: () -> Unit,
-    onSwitchSeries: (seriesId: String) -> Unit = {}
+    onSwitchSeries: (seriesId: String) -> Unit = {},
+    onSearchAll: (keyword: String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -188,9 +190,21 @@ fun DramaSeriesPlayerScreen(
     var showQualitySheet by remember { mutableStateOf(false) }
     var usedInitialPos by remember { mutableStateOf(false) }
     var topBarHeightPx by remember { mutableIntStateOf(0) }
-    var seriesSeasons by remember(loadedDetail.seriesId) { mutableStateOf<List<SeriesSeasonItem>>(emptyList()) }
-    var seasonsLoading by remember(loadedDetail.seriesId) { mutableStateOf(false) }
-    var seasonsLoaded by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var relatedBundle by remember(loadedDetail.seriesId) { mutableStateOf<RelatedDramaBundle?>(null) }
+    var relatedLoading by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var relatedLoadingMore by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var relatedError by remember(loadedDetail.seriesId) { mutableStateOf<String?>(null) }
+    var relatedReloadTick by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
+
+    fun openDetailSheet() {
+        relatedReloadTick++
+        showDetailSheet = true
+    }
+
+    fun openEpisodeSheet() {
+        relatedReloadTick++
+        showEpisodeSheet = true
+    }
 
     val currentSummary = remember(loadedDetail) {
         DramaSummary(
@@ -211,18 +225,16 @@ fun DramaSeriesPlayerScreen(
         )
     }
 
-    LaunchedEffect(showDetailSheet, showEpisodeSheet, loadedDetail.seriesId) {
-        if ((showDetailSheet || showEpisodeSheet) && !seasonsLoaded) {
-            val peeked = container.apiClient.peekSeriesSeasons(currentSummary)
-            if (peeked != null) {
-                seriesSeasons = peeked
-                seasonsLoaded = true
-                seasonsLoading = false
-            } else {
-                seasonsLoading = true
-                seriesSeasons = container.apiClient.fetchSeriesSeasons(currentSummary)
-                seasonsLoading = false
-                seasonsLoaded = true
+    LaunchedEffect(loadedDetail.seriesId, relatedReloadTick) {
+        if (relatedReloadTick > 0) {
+            relatedLoading = true
+            relatedError = null
+            try {
+                relatedBundle = container.apiClient.fetchRelatedDramas(currentSummary)
+            } catch (e: Exception) {
+                relatedError = e.message ?: "相关推荐加载失败"
+            } finally {
+                relatedLoading = false
             }
         }
     }
@@ -423,7 +435,7 @@ fun DramaSeriesPlayerScreen(
                         FeedActionIcon(
                             icon = Icons.AutoMirrored.Filled.List,
                             label = "选集",
-                            onClick = { showEpisodeSheet = true }
+                            onClick = { openEpisodeSheet() }
                         )
                         FeedActionIcon(
                             icon = Icons.Default.Speed,
@@ -518,7 +530,7 @@ fun DramaSeriesPlayerScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { showDetailSheet = true }
+                                .clickable { openDetailSheet() }
                         ) {
                             Text(
                                 text = loadedDetail.title,
@@ -610,7 +622,7 @@ fun DramaSeriesPlayerScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { showDetailSheet = true }
+                        .clickable { openDetailSheet() }
                 )
                 if (isFullscreen) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -639,7 +651,7 @@ fun DramaSeriesPlayerScreen(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color.Black.copy(alpha = 0.48f))
-                                .clickable { showEpisodeSheet = true }
+                                .clickable { openEpisodeSheet() }
                                 .padding(horizontal = 10.dp, vertical = 6.dp)
                         ) {
                             Text("选集", color = Color.White, fontSize = 12.sp)
@@ -665,13 +677,19 @@ fun DramaSeriesPlayerScreen(
 
     if (showDetailSheet) {
         val historyMap = remember(history) { history.associateBy { it.seriesId } }
+        val activeBundle = relatedBundle
         DramaDetailSheet(
             summary = currentSummary,
             detail = loadedDetail,
             detailLoading = false,
             isFavorite = isFav,
-            seasons = seriesSeasons,
-            seasonsLoading = seasonsLoading,
+            seasons = activeBundle?.seasons.orEmpty(),
+            related = activeBundle?.related.orEmpty(),
+            relatedKeyword = activeBundle?.keyword ?: SeriesSeasonMatcher.extractSearchKeyword(currentSummary.title),
+            relatedLoading = relatedLoading,
+            relatedLoadingMore = relatedLoadingMore,
+            hasMoreRelated = activeBundle?.hasMore == true,
+            relatedError = relatedError,
             historyBySeriesId = historyMap,
             primaryActionLabel = "选集列表",
             onToggleFavorite = { container.accountManager.toggleFavoriteAndSync(currentSummary) },
@@ -685,9 +703,26 @@ fun DramaSeriesPlayerScreen(
                     showQualitySheet = true
                 }
             },
-            onSwitchSeason = { targetId ->
+            onSelectDrama = { targetId ->
                 showDetailSheet = false
                 onSwitchSeries(targetId)
+            },
+            onRetryRelated = { relatedReloadTick++ },
+            onLoadMoreRelated = {
+                val curBundle = relatedBundle
+                if (curBundle != null && curBundle.hasMore && !relatedLoadingMore) {
+                    scope.launch {
+                        relatedLoadingMore = true
+                        runCatching {
+                            relatedBundle = container.apiClient.fetchMoreRelatedDramas(currentSummary, curBundle)
+                        }
+                        relatedLoadingMore = false
+                    }
+                }
+            },
+            onSearchAll = { kw ->
+                showDetailSheet = false
+                onSearchAll(kw)
             },
             onDismiss = { showDetailSheet = false }
         )
@@ -699,7 +734,7 @@ fun DramaSeriesPlayerScreen(
             detail = loadedDetail,
             currentEpisodeIndex = pagerState.currentPage + 1,
             watchedUpToEpisode = watchedEp,
-            seasons = seriesSeasons,
+            seasons = relatedBundle?.seasons.orEmpty(),
             onSwitchSeason = { targetId ->
                 showEpisodeSheet = false
                 onSwitchSeries(targetId)

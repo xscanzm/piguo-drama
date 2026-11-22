@@ -37,11 +37,22 @@ import io.github.hongguo.mobile.ui.theme.SurfaceElevated
 import io.github.hongguo.mobile.ui.theme.TextPrimary
 import io.github.hongguo.mobile.ui.theme.TextSecondary
 
+private fun formatTransferSpeed(bytesPerSec: Long): String {
+    if (bytesPerSec <= 0L) return ""
+    val kb = bytesPerSec / 1024.0
+    return if (kb >= 1024.0) {
+        " · %.1f MB/s".format(kb / 1024.0)
+    } else {
+        " · %d KB/s".format(kb.toInt().coerceAtLeast(1))
+    }
+}
+
 @Composable
 fun AppUpdateDialog(
     status: UpdateStatus,
     onDismiss: (skipInSession: Boolean) -> Unit,
     onStartDownload: (AppUpdateInfo) -> Unit,
+    onCancelDownload: () -> Unit,
     onTriggerInstall: (UpdateStatus.ReadyToInstall) -> Unit,
     onOpenBrowser: (String) -> Unit
 ) {
@@ -116,8 +127,24 @@ fun AppUpdateDialog(
                     is UpdateStatus.Downloading -> {
                         val total = status.totalBytes
                         val downloaded = status.downloadedBytes
+                        val speedSuffix = formatTransferSpeed(status.speedBytesPerSec)
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (total > 0L) {
+                            if (status.connecting || downloaded <= 0L || total <= 0L) {
+                                LinearProgressIndicator(
+                                    color = CoralRed,
+                                    trackColor = SurfaceElevated,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Text(
+                                    text = if (status.connecting || downloaded <= 0L) {
+                                        status.channelLabel
+                                    } else {
+                                        "${status.channelLabel} · 已下载 %.2f MB$speedSuffix".format(downloaded / (1024.0 * 1024.0))
+                                    },
+                                    color = TextSecondary,
+                                    fontSize = 12.sp
+                                )
+                            } else {
                                 val pct = (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
                                 LinearProgressIndicator(
                                     progress = { pct },
@@ -126,21 +153,10 @@ fun AppUpdateDialog(
                                     modifier = Modifier.fillMaxWidth()
                                 )
                                 Text(
-                                    text = "正在下载 %.2f / %.2f MB (${(pct * 100).toInt()}%)".format(
+                                    text = "${status.channelLabel} · %.2f / %.2f MB (${(pct * 100).toInt()}%)$speedSuffix".format(
                                         downloaded / (1024.0 * 1024.0),
                                         total / (1024.0 * 1024.0)
                                     ),
-                                    color = TextSecondary,
-                                    fontSize = 12.sp
-                                )
-                            } else {
-                                LinearProgressIndicator(
-                                    color = CoralRed,
-                                    trackColor = SurfaceElevated,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Text(
-                                    text = "已下载 %.2f MB...".format(downloaded / (1024.0 * 1024.0)),
                                     color = TextSecondary,
                                     fontSize = 12.sp
                                 )
@@ -158,41 +174,35 @@ fun AppUpdateDialog(
                     }
 
                     is UpdateStatus.Error -> {
-                        Text(
-                            text = status.message,
-                            color = CoralRed,
-                            fontSize = 12.sp,
-                            lineHeight = 17.sp
-                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = status.message,
+                                color = CoralRed,
+                                fontSize = 12.sp,
+                                lineHeight = 17.sp
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                TextButton(
+                                    onClick = { onOpenBrowser(info.htmlUrl.ifBlank { LATEST_RELEASE_PAGE_URL }) }
+                                ) {
+                                    Text("浏览器备用下载", color = Color(0xFF8EC5FF), fontSize = 12.sp)
+                                }
+                            }
+                        }
                     }
 
                     else -> Unit
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    TextButton(
-                        onClick = { onOpenBrowser(info.htmlUrl.ifBlank { LATEST_RELEASE_PAGE_URL }) }
-                    ) {
-                        Text("浏览器打开下载页", color = TextSecondary, fontSize = 12.sp)
-                    }
                 }
             }
         },
         confirmButton = {
             when (status) {
                 is UpdateStatus.Downloading -> {
-                    Button(
-                        onClick = {},
-                        enabled = false,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = CoralRed.copy(alpha = 0.45f),
-                            disabledContainerColor = CoralRed.copy(alpha = 0.45f)
-                        )
-                    ) {
-                        Text("下载中...", color = Color.White)
+                    TextButton(onClick = onCancelDownload) {
+                        Text("取消下载", color = TextSecondary)
                     }
                 }
 
@@ -227,7 +237,7 @@ fun AppUpdateDialog(
         dismissButton = {
             if (isDownloading) {
                 TextButton(onClick = { onDismiss(false) }) {
-                    Text("后台下载", color = TextSecondary)
+                    Text("后台下载", color = Color(0xFF8EC5FF))
                 }
             } else {
                 TextButton(onClick = { onDismiss(true) }) {

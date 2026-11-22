@@ -583,10 +583,17 @@ fun ProfileScreen(container: AppContainer) {
                     updateStatus is UpdateStatus.ReadyToInstall
                 Button(
                     onClick = {
-                        when (updateStatus) {
+                        when (val st = updateStatus) {
                             is UpdateStatus.Available,
                             is UpdateStatus.ReadyToInstall,
                             is UpdateStatus.Downloading -> container.updateManager.openUpdateDialog()
+                            is UpdateStatus.Error -> {
+                                if (st.info != null) {
+                                    container.updateManager.openUpdateDialog()
+                                } else {
+                                    container.updateManager.checkForUpdates(silent = false)
+                                }
+                            }
                             else -> container.updateManager.checkForUpdates(silent = false)
                         }
                     },
@@ -597,11 +604,12 @@ fun ProfileScreen(container: AppContainer) {
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = when (updateStatus) {
+                        text = when (val st = updateStatus) {
                             is UpdateStatus.Checking -> "检查中..."
                             is UpdateStatus.Available -> "发现新版"
                             is UpdateStatus.ReadyToInstall -> "安装新版"
                             is UpdateStatus.Downloading -> "下载中"
+                            is UpdateStatus.Error -> if (st.info != null) "重试更新" else "检查更新"
                             else -> "检查更新"
                         },
                         color = if (hasNewUpdate) Color.White else TextPrimary,
@@ -613,6 +621,13 @@ fun ProfileScreen(container: AppContainer) {
             when (val u = updateStatus) {
                 is UpdateStatus.Checking -> {
                     Text("正在检查更新...", color = TextSecondary, fontSize = 12.sp)
+                }
+                is UpdateStatus.Downloading -> {
+                    val pctText = if (u.totalBytes > 0L && u.downloadedBytes > 0L) {
+                        val pct = ((u.downloadedBytes.toFloat() / u.totalBytes.toFloat()) * 100f).toInt().coerceIn(0, 100)
+                        " · $pct%"
+                    } else ""
+                    Text("正在应用内下载 (${u.channelLabel}$pctText)...", color = TextSecondary, fontSize = 12.sp)
                 }
                 is UpdateStatus.UpToDate -> {
                     Text("当前已是最新版本 (v${u.currentVersion})", color = Color(0xFF7AD97A), fontSize = 12.sp)
