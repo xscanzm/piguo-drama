@@ -30,7 +30,6 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -65,17 +64,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.hongguo.mobile.AppContainer
 import io.github.hongguo.mobile.core.DramaDetail
-import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.QualityPreference
 import io.github.hongguo.mobile.core.RelatedDramaBundle
 import io.github.hongguo.mobile.core.SeriesSeasonMatcher
 import io.github.hongguo.mobile.core.shouldRecordWatchHistory
 import io.github.hongguo.mobile.player.ResolvedMediaSource
-import io.github.hongguo.mobile.ui.components.CategoryTagChips
-import io.github.hongguo.mobile.ui.components.DarkHorseBadge
 import io.github.hongguo.mobile.ui.components.DramaDetailSheet
-import io.github.hongguo.mobile.ui.components.DramaQualityBadge
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
 import io.github.hongguo.mobile.ui.components.EpisodePickerSheet
 import io.github.hongguo.mobile.ui.components.LandscapeFullscreenEffect
@@ -84,7 +79,6 @@ import io.github.hongguo.mobile.ui.components.VerticalDramaPlayer
 import io.github.hongguo.mobile.ui.components.enterPipMode
 import io.github.hongguo.mobile.ui.theme.CoralRed
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 private data class EpisodeLoadState(
     val media: ResolvedMediaSource? = null,
@@ -309,7 +303,6 @@ fun DramaSeriesPlayerScreen(
                 !usedInitialPos && ep.index == initialEpisodeIndex -> initialPositionMs
                 else -> 0L
             }
-            var descExpanded by remember { mutableStateOf(false) }
             var bottomContentHeightPx by remember { mutableIntStateOf(0) }
             val measuredTopClearanceDp = with(density) { topBarHeightPx.toDp() }
             val effectiveTopClearanceDp = if (!cleanMode && measuredTopClearanceDp > 0.dp) {
@@ -393,10 +386,10 @@ fun DramaSeriesPlayerScreen(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .height(220.dp)
+                            .height(120.dp)
                             .background(
                                 Brush.verticalGradient(
-                                    listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f))
+                                    listOf(Color.Transparent, Color.Black.copy(alpha = 0.65f))
                                 )
                             )
                     )
@@ -464,7 +457,7 @@ fun DramaSeriesPlayerScreen(
                     }
                 }
 
-                // Bottom-left episode title, leading S/A/B/C badge & hint
+                // Bottom-left compact drama title (tap to view details)
                 AnimatedVisibility(
                     visible = !cleanMode && !longPressActive && !isFullscreen && !inPip,
                     enter = fadeIn(),
@@ -476,113 +469,28 @@ fun DramaSeriesPlayerScreen(
                         .fillMaxWidth(0.76f)
                         .padding(start = 14.dp, bottom = 36.dp)
                 ) {
-                    val seriesQuality = loadedDetail.quality
-                    val statParts = buildList {
-                        if (ep.diggCount > 0L) add("本集赞 ${formatCompactCount(ep.diggCount)}")
-                        if (seriesQuality != null && seriesQuality.followedCount > 0L) {
-                            add("${formatCompactCount(seriesQuality.followedCount)}追剧")
-                        }
-                        if (seriesQuality != null && seriesQuality.storyRetention > 0f) {
-                            add("留存 ${(seriesQuality.storyRetention * 100f).roundToInt()}%")
-                        }
-                    }
-                    Column {
-                        if (seriesQuality != null || statParts.isNotEmpty()) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .let { if (seriesQuality != null) it.clickable { showQualitySheet = true } else it }
-                            ) {
-                                if (seriesQuality != null) {
-                                    DramaQualityBadge(
-                                        report = seriesQuality,
-                                        prominent = true,
-                                        onClick = { showQualitySheet = true }
-                                    )
-                                }
-                                if (seriesQuality?.isDarkHorse == true) {
-                                    DarkHorseBadge(onClick = { showQualitySheet = true })
-                                }
-                                if (statParts.isNotEmpty()) {
-                                    Text(
-                                        text = statParts.joinToString(" · "),
-                                        color = Color.White.copy(alpha = 0.86f),
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f, fill = false)
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        if (loadedDetail.displayTags.isNotEmpty()) {
-                            CategoryTagChips(
-                                tags = loadedDetail.displayTags,
-                                gender = loadedDetail.gender,
-                                isNew = (loadedDetail.quality?.ageDays ?: -1) in 0..7
-                            )
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { openDetailSheet() }
-                        ) {
-                            Text(
-                                text = loadedDetail.title,
-                                color = Color.White,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            Spacer(Modifier.width(2.dp))
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                contentDescription = "查看短剧详情",
-                                tint = Color.White.copy(alpha = 0.72f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        if (loadedDetail.description.isNotEmpty()) {
-                            Spacer(Modifier.height(5.dp))
-                            Text(
-                                text = loadedDetail.description,
-                                color = Color.White.copy(alpha = 0.85f),
-                                fontSize = 13.sp,
-                                maxLines = if (descExpanded) 5 else 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.clickable { descExpanded = !descExpanded }
-                            )
-                        }
-                        if (page + 1 < loadedDetail.episodes.size) {
-                            Spacer(Modifier.height(8.dp))
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(Color.White.copy(alpha = 0.14f))
-                                    .clickable { scope.launch { pagerState.animateScrollToPage(page + 1) } }
-                                    .padding(horizontal = 10.dp, vertical = 5.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.KeyboardArrowUp,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Text(
-                                    text = "上滑看第${ep.index + 1}集 · 共${loadedDetail.episodes.size}集",
-                                    color = Color.White.copy(alpha = 0.9f),
-                                    fontSize = 12.sp
-                                )
-                            }
-                        }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { openDetailSheet() }
+                    ) {
+                        Text(
+                            text = loadedDetail.title,
+                            color = Color.White.copy(alpha = 0.92f),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        Spacer(Modifier.width(2.dp))
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = "查看短剧详情",
+                            tint = Color.White.copy(alpha = 0.72f),
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 }
             }
