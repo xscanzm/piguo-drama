@@ -38,3 +38,42 @@ fun computeVideoViewportSize(
         }
     }
 }
+
+enum class FullscreenButtonAnchor {
+    BELOW_VIDEO,
+    ABOVE_VIDEO,
+    INSIDE_VIDEO_TOP_END
+}
+
+data class FullscreenButtonPlacement(
+    val anchor: FullscreenButtonAnchor,
+    val topOffsetDp: Float
+)
+
+fun computeFullscreenButtonPlacement(
+    containerHDp: Float,
+    videoRenderedHDp: Float,
+    topBarClearanceDp: Float,
+    bottomOverlayClearanceDp: Float,
+    buttonHeightDp: Float = 36f,
+    gapDp: Float = 12f
+): FullscreenButtonPlacement {
+    val safeContainerH = containerHDp.coerceAtLeast(1f)
+    val safeVideoH = videoRenderedHDp.coerceIn(0f, safeContainerH)
+    val videoTop = (safeContainerH - safeVideoH) / 2f
+    val videoBottom = (safeContainerH + safeVideoH) / 2f
+    val maxBottom = (safeContainerH - bottomOverlayClearanceDp).coerceAtLeast(0f)
+
+    val belowTop = videoBottom + gapDp
+    if (belowTop + buttonHeightDp <= maxBottom) {
+        return FullscreenButtonPlacement(FullscreenButtonAnchor.BELOW_VIDEO, belowTop)
+    }
+
+    val aboveTop = videoTop - gapDp - buttonHeightDp
+    if (aboveTop >= topBarClearanceDp) {
+        return FullscreenButtonPlacement(FullscreenButtonAnchor.ABOVE_VIDEO, aboveTop)
+    }
+
+    val insideTop = maxOf(videoTop + 10f, topBarClearanceDp)
+    return FullscreenButtonPlacement(FullscreenButtonAnchor.INSIDE_VIDEO_TOP_END, insideTop)
+}

@@ -100,13 +100,25 @@ private fun HongguoRootApp(container: AppContainer) {
         container.updateManager.checkForUpdates(silent = true)
     }
 
-    fun openSeriesPlayer(seriesId: String, episodeIndex: Int = 1, positionMs: Long = 0L) {
+    fun openSeriesPlayer(
+        seriesId: String,
+        episodeIndex: Int = 1,
+        positionMs: Long = 0L,
+        replaceCurrent: Boolean = false
+    ) {
         val hist = if (episodeIndex == 1 && positionMs == 0L) {
             container.localStore.getLastWatchEntry(seriesId)
         } else null
         val ep = hist?.lastEpisodeIndex ?: episodeIndex
         val pos = hist?.positionMs ?: positionMs
-        navController.navigate("player/$seriesId?episode=$ep&pos=$pos")
+        val route = "player/$seriesId?episode=$ep&pos=$pos"
+        if (replaceCurrent) {
+            navController.navigate(route) {
+                popUpTo("player/{seriesId}?episode={episode}&pos={pos}") { inclusive = true }
+            }
+        } else {
+            navController.navigate(route)
+        }
     }
 
     Scaffold(
@@ -209,7 +221,8 @@ private fun HongguoRootApp(container: AppContainer) {
                         seriesId = seriesId,
                         initialEpisodeIndex = ep,
                         initialPositionMs = pos,
-                        onBack = { navController.popBackStack() }
+                        onBack = { navController.popBackStack() },
+                        onSwitchSeries = { targetId -> openSeriesPlayer(targetId, replaceCurrent = true) }
                     )
                 }
             }

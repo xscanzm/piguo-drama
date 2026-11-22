@@ -61,7 +61,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -74,12 +76,14 @@ import io.github.hongguo.mobile.core.DramaQualityReport
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.HomeFeedEndedAction
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.SeriesSeasonItem
 import io.github.hongguo.mobile.core.resolveHomeFeedEndedAction
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.components.DarkHorseBadge
+import io.github.hongguo.mobile.ui.components.DramaDetailSheet
 import io.github.hongguo.mobile.ui.components.DramaQualityBadge
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
 import io.github.hongguo.mobile.ui.components.EpisodePickerSheet
@@ -200,6 +204,11 @@ fun HomeFeedScreen(
     var fullscreenControlsVisible by remember { mutableStateOf(true) }
     var longPressActive by remember { mutableStateOf(false) }
     var showEpisodeSheetFor by remember { mutableStateOf<DramaDetail?>(null) }
+    var showDetailSheetFor by remember { mutableStateOf<DramaSummary?>(null) }
+    var detailSheetDetailLoading by remember { mutableStateOf(false) }
+    var detailSheetSeasons by remember { mutableStateOf<List<SeriesSeasonItem>>(emptyList()) }
+    var detailSheetSeasonsLoading by remember { mutableStateOf(false) }
+    var topBarHeightPx by remember { mutableIntStateOf(0) }
     var showQualitySheetFor by remember { mutableStateOf<HomeQualitySheetTarget?>(null) }
     var showSpeedSheet by remember { mutableStateOf(false) }
     var retryTick by remember { mutableIntStateOf(0) }
@@ -490,6 +499,62 @@ fun HomeFeedScreen(
         }
     }
 
+    val density = LocalDensity.current
+
+    LaunchedEffect(showDetailSheetFor?.seriesId, showEpisodeSheetFor?.seriesId) {
+        val target = showDetailSheetFor ?: showEpisodeSheetFor?.let { epDet ->
+            rawFeedItems.firstOrNull { it.seriesId == epDet.seriesId }
+                ?: DramaSummary(
+                    seriesId = epDet.seriesId,
+                    title = epDet.title,
+                    cover = epDet.cover,
+                    episodeCount = epDet.episodes.size,
+                    description = epDet.description
+                )
+        } ?: return@LaunchedEffect
+        val existingDetail = episodeStates[target.seriesId]?.detail ?: container.apiClient.peekSeriesDetail(target.seriesId)
+        if (showDetailSheetFor != null && existingDetail == null) {
+            detailSheetDetailLoading = true
+            launch {
+                runCatching {
+                    val fetched = container.apiClient.fetchSeriesDetail(target.seriesId)
+                    val curState = episodeStates[target.seriesId]
+                    val resolvedEpIdx = if (target.initialVid.isNotEmpty()) {
+                        fetched.episodes.firstOrNull { it.vid == target.initialVid }?.index
+                            ?: curState?.episodeIndex
+                            ?: target.initialEpisodeIndex
+                    } else {
+                        curState?.episodeIndex ?: target.initialEpisodeIndex
+                    }
+                    episodeStates[target.seriesId] = (curState ?: FeedEpisodeState()).copy(
+                        detail = fetched,
+                        episodeIndex = resolvedEpIdx
+                    )
+                }
+                detailSheetDetailLoading = false
+            }
+        } else {
+            detailSheetDetailLoading = false
+        }
+
+        val effectiveTarget = if (existingDetail != null && existingDetail.title.isNotBlank()) {
+            target.copy(
+                title = existingDetail.title,
+                episodeCount = existingDetail.episodes.size.coerceAtLeast(target.episodeCount)
+            )
+        } else target
+        val peeked = container.apiClient.peekSeriesSeasons(effectiveTarget)
+        if (peeked != null) {
+            detailSheetSeasons = peeked
+            detailSheetSeasonsLoading = false
+        } else {
+            detailSheetSeasons = emptyList()
+            detailSheetSeasonsLoading = true
+            detailSheetSeasons = container.apiClient.fetchSeriesSeasons(effectiveTarget)
+            detailSheetSeasonsLoading = false
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -536,6 +601,15 @@ fun HomeFeedScreen(
                 }
 
                 var descExpanded by remember(drama.seriesId) { mutableStateOf(false) }
+                var bottomOverlayHeightPx by remember(drama.seriesId) { mutableIntStateOf(0) }
+                val measuredTopClearanceDp = with(density) { topBarHeightPx.toDp() }
+                val effectiveTopClearanceDp = if (!cleanMode && measuredTopClearanceDp > 0.dp) {
+                    measuredTopClearanceDp + 6.dp
+                } else 44.dp
+                val measuredBottomClearanceDp = with(density) { bottomOverlayHeightPx.toDp() }
+                val effectiveBottomClearanceDp = if (!cleanMode && measuredBottomClearanceDp > 0.dp) {
+                    measuredBottomClearanceDp + 8.dp
+                } else 44.dp
 
                 Box(modifier = Modifier.fillMaxSize()) {
                     VerticalDramaPlayer(
@@ -552,6 +626,8 @@ fun HomeFeedScreen(
                         isInPipMode = inPip,
                         backgroundAudioPlay = settings.backgroundAudioPlay,
                         sleepTriggerCount = sleepState.triggerCount,
+                        topSafeClearanceDp = effectiveTopClearanceDp,
+                        bottomOverlayClearanceDp = effectiveBottomClearanceDp,
                         onRetry = {
                             episodeStates.remove(drama.seriesId)
                             retryTick++
@@ -716,6 +792,7 @@ fun HomeFeedScreen(
                         exit = fadeOut(),
                         modifier = Modifier
                             .align(Alignment.BottomStart)
+                            .onSizeChanged { bottomOverlayHeightPx = it.height }
                             .fillMaxWidth(0.78f)
                             .padding(start = 14.dp, bottom = 34.dp)
                     ) {
@@ -794,15 +871,29 @@ fun HomeFeedScreen(
                                 )
                                 Spacer(Modifier.height(6.dp))
                             }
-                            Text(
-                                text = displayTitle,
-                                color = Color.White,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.fillMaxWidth()
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showDetailSheetFor = drama }
+                            ) {
+                                Text(
+                                    text = displayTitle,
+                                    color = Color.White,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false)
+                                )
+                                Spacer(Modifier.width(2.dp))
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = "查看短剧详情",
+                                    tint = Color.White.copy(alpha = 0.72f),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                             val desc = epState.detail?.description?.ifEmpty { drama.description } ?: drama.description
                             if (desc.isNotEmpty()) {
                                 Spacer(Modifier.height(4.dp))
@@ -862,6 +953,7 @@ fun HomeFeedScreen(
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.TopCenter)
+                .onSizeChanged { topBarHeightPx = it.height }
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(horizontal = 14.dp, vertical = 8.dp)
@@ -1100,6 +1192,58 @@ fun HomeFeedScreen(
         }
     }
 
+    showDetailSheetFor?.let { target ->
+        val targetState = episodeStates[target.seriesId]
+        val targetDetail = targetState?.detail
+        val targetQuality = targetDetail?.quality ?: target.quality
+        val targetTitle = targetDetail?.title ?: target.title
+        val targetEpIdx = targetState?.episodeIndex ?: target.initialEpisodeIndex
+        val historyMap = remember(history) { history.associateBy { it.seriesId } }
+        DramaDetailSheet(
+            summary = target,
+            detail = targetDetail,
+            detailLoading = detailSheetDetailLoading,
+            isFavorite = favorites.any { it.seriesId == target.seriesId },
+            seasons = detailSheetSeasons,
+            seasonsLoading = detailSheetSeasonsLoading,
+            historyBySeriesId = historyMap,
+            primaryActionLabel = "观看全集",
+            onToggleFavorite = { container.accountManager.toggleFavoriteAndSync(target) },
+            onPrimaryAction = {
+                showDetailSheetFor = null
+                onOpenSeriesPlayer(
+                    target.seriesId,
+                    targetEpIdx,
+                    livePositions[target.seriesId] ?: 0L
+                )
+            },
+            onOpenQualitySheet = targetQuality?.let { q ->
+                {
+                    showDetailSheetFor = null
+                    showQualitySheetFor = HomeQualitySheetTarget(
+                        title = targetTitle,
+                        report = q,
+                        episodeIndex = targetEpIdx,
+                        episodeDigg = targetDetail?.episodes?.getOrNull(targetEpIdx - 1)?.diggCount ?: q.ep1Digg,
+                        episodeDiggs = targetDetail?.episodes?.map { it.diggCount }.orEmpty(),
+                        tags = targetDetail?.categoryNames?.ifEmpty { null } ?: target.categoryNames.ifEmpty { target.tags },
+                        episodeComments = targetDetail?.episodes?.map { it.commentCount }.orEmpty()
+                    )
+                }
+            },
+            onSwitchSeason = { targetSeriesId ->
+                showDetailSheetFor = null
+                val hist = container.localStore.getLastWatchEntry(targetSeriesId)
+                onOpenSeriesPlayer(
+                    targetSeriesId,
+                    hist?.lastEpisodeIndex ?: 1,
+                    hist?.positionMs ?: 0L
+                )
+            },
+            onDismiss = { showDetailSheetFor = null }
+        )
+    }
+
     showEpisodeSheetFor?.let { detail ->
         val epState = episodeStates[detail.seriesId]
         val watchedEp = history.firstOrNull { it.seriesId == detail.seriesId }?.lastEpisodeIndex ?: 0
@@ -1107,6 +1251,16 @@ fun HomeFeedScreen(
             detail = detail,
             currentEpisodeIndex = epState?.episodeIndex ?: 1,
             watchedUpToEpisode = watchedEp,
+            seasons = detailSheetSeasons,
+            onSwitchSeason = { targetSeriesId ->
+                showEpisodeSheetFor = null
+                val hist = container.localStore.getLastWatchEntry(targetSeriesId)
+                onOpenSeriesPlayer(
+                    targetSeriesId,
+                    hist?.lastEpisodeIndex ?: 1,
+                    hist?.positionMs ?: 0L
+                )
+            },
             onSelectEpisode = { chosenIdx ->
                 onOpenSeriesPlayer(detail.seriesId, chosenIdx, 0L)
             },

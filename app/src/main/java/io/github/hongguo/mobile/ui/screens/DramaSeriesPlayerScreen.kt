@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -55,7 +56,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -65,10 +68,12 @@ import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.SeriesSeasonItem
 import io.github.hongguo.mobile.core.shouldRecordWatchHistory
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.components.DarkHorseBadge
+import io.github.hongguo.mobile.ui.components.DramaDetailSheet
 import io.github.hongguo.mobile.ui.components.DramaQualityBadge
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
 import io.github.hongguo.mobile.ui.components.EpisodePickerSheet
@@ -92,12 +97,15 @@ fun DramaSeriesPlayerScreen(
     seriesId: String,
     initialEpisodeIndex: Int,
     initialPositionMs: Long,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onSwitchSeries: (seriesId: String) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val settings by container.localStore.settings.collectAsState()
     val favorites by container.localStore.favorites.collectAsState()
+    val history by container.localStore.history.collectAsState()
     val inPip by container.isInPipMode.collectAsState()
     val sleepState by container.sleepTimer.state.collectAsState()
 
@@ -175,9 +183,49 @@ fun DramaSeriesPlayerScreen(
     var curVideoW by remember { mutableIntStateOf(0) }
     var curVideoH by remember { mutableIntStateOf(0) }
     var showEpisodeSheet by remember { mutableStateOf(false) }
+    var showDetailSheet by remember { mutableStateOf(false) }
     var showSpeedSheet by remember { mutableStateOf(false) }
     var showQualitySheet by remember { mutableStateOf(false) }
     var usedInitialPos by remember { mutableStateOf(false) }
+    var topBarHeightPx by remember { mutableIntStateOf(0) }
+    var seriesSeasons by remember(loadedDetail.seriesId) { mutableStateOf<List<SeriesSeasonItem>>(emptyList()) }
+    var seasonsLoading by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var seasonsLoaded by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+
+    val currentSummary = remember(loadedDetail) {
+        DramaSummary(
+            seriesId = loadedDetail.seriesId,
+            title = loadedDetail.title,
+            cover = loadedDetail.cover,
+            episodeCount = loadedDetail.episodes.size,
+            description = loadedDetail.description,
+            tags = loadedDetail.categoryNames,
+            episodeLabel = loadedDetail.episodeLabel,
+            followedCount = loadedDetail.followedCount,
+            seriesPlayCount = loadedDetail.seriesPlayCount,
+            quality = loadedDetail.quality,
+            categoryNames = loadedDetail.categoryNames,
+            displayTags = loadedDetail.displayTags,
+            gender = loadedDetail.gender,
+            createTimeSec = loadedDetail.createTimeSec
+        )
+    }
+
+    LaunchedEffect(showDetailSheet, showEpisodeSheet, loadedDetail.seriesId) {
+        if ((showDetailSheet || showEpisodeSheet) && !seasonsLoaded) {
+            val peeked = container.apiClient.peekSeriesSeasons(currentSummary)
+            if (peeked != null) {
+                seriesSeasons = peeked
+                seasonsLoaded = true
+                seasonsLoading = false
+            } else {
+                seasonsLoading = true
+                seriesSeasons = container.apiClient.fetchSeriesSeasons(currentSummary)
+                seasonsLoading = false
+                seasonsLoaded = true
+            }
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose { container.localStore.flushWatchHistory() }
@@ -250,6 +298,15 @@ fun DramaSeriesPlayerScreen(
                 else -> 0L
             }
             var descExpanded by remember { mutableStateOf(false) }
+            var bottomContentHeightPx by remember { mutableIntStateOf(0) }
+            val measuredTopClearanceDp = with(density) { topBarHeightPx.toDp() }
+            val effectiveTopClearanceDp = if (!cleanMode && measuredTopClearanceDp > 0.dp) {
+                measuredTopClearanceDp + 6.dp
+            } else 44.dp
+            val measuredBottomClearanceDp = with(density) { bottomContentHeightPx.toDp() }
+            val effectiveBottomClearanceDp = if (!cleanMode && measuredBottomClearanceDp > 0.dp) {
+                measuredBottomClearanceDp + 8.dp
+            } else 44.dp
 
             Box(modifier = Modifier.fillMaxSize()) {
                 VerticalDramaPlayer(
@@ -266,6 +323,8 @@ fun DramaSeriesPlayerScreen(
                     isInPipMode = inPip,
                     backgroundAudioPlay = settings.backgroundAudioPlay,
                     sleepTriggerCount = sleepState.triggerCount,
+                    topSafeClearanceDp = effectiveTopClearanceDp,
+                    bottomOverlayClearanceDp = effectiveBottomClearanceDp,
                     onRetry = {
                         episodeStates.remove(ep.vid)
                         mediaRetryTick++
@@ -401,6 +460,7 @@ fun DramaSeriesPlayerScreen(
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .navigationBarsPadding()
+                        .onSizeChanged { bottomContentHeightPx = it.height }
                         .fillMaxWidth(0.76f)
                         .padding(start = 14.dp, bottom = 36.dp)
                 ) {
@@ -454,15 +514,29 @@ fun DramaSeriesPlayerScreen(
                             )
                             Spacer(Modifier.height(6.dp))
                         }
-                        Text(
-                            text = loadedDetail.title,
-                            color = Color.White,
-                            fontSize = 17.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showDetailSheet = true }
+                        ) {
+                            Text(
+                                text = loadedDetail.title,
+                                color = Color.White,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Spacer(Modifier.width(2.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "查看短剧详情",
+                                tint = Color.White.copy(alpha = 0.72f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                         if (loadedDetail.description.isNotEmpty()) {
                             Spacer(Modifier.height(5.dp))
                             Text(
@@ -509,6 +583,7 @@ fun DramaSeriesPlayerScreen(
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.TopCenter)
+                .onSizeChanged { topBarHeightPx = it.height }
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -533,7 +608,9 @@ fun DramaSeriesPlayerScreen(
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { showDetailSheet = true }
                 )
                 if (isFullscreen) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -586,12 +663,47 @@ fun DramaSeriesPlayerScreen(
         }
     }
 
+    if (showDetailSheet) {
+        val historyMap = remember(history) { history.associateBy { it.seriesId } }
+        DramaDetailSheet(
+            summary = currentSummary,
+            detail = loadedDetail,
+            detailLoading = false,
+            isFavorite = isFav,
+            seasons = seriesSeasons,
+            seasonsLoading = seasonsLoading,
+            historyBySeriesId = historyMap,
+            primaryActionLabel = "选集列表",
+            onToggleFavorite = { container.accountManager.toggleFavoriteAndSync(currentSummary) },
+            onPrimaryAction = {
+                showDetailSheet = false
+                showEpisodeSheet = true
+            },
+            onOpenQualitySheet = loadedDetail.quality?.let {
+                {
+                    showDetailSheet = false
+                    showQualitySheet = true
+                }
+            },
+            onSwitchSeason = { targetId ->
+                showDetailSheet = false
+                onSwitchSeries(targetId)
+            },
+            onDismiss = { showDetailSheet = false }
+        )
+    }
+
     if (showEpisodeSheet) {
         val watchedEp = container.localStore.getLastWatchEntry(loadedDetail.seriesId)?.lastEpisodeIndex ?: 0
         EpisodePickerSheet(
             detail = loadedDetail,
             currentEpisodeIndex = pagerState.currentPage + 1,
             watchedUpToEpisode = watchedEp,
+            seasons = seriesSeasons,
+            onSwitchSeason = { targetId ->
+                showEpisodeSheet = false
+                onSwitchSeries(targetId)
+            },
             onSelectEpisode = { chosen ->
                 val target = (chosen - 1).coerceIn(0, loadedDetail.episodes.size - 1)
                 scope.launch { pagerState.scrollToPage(target) }

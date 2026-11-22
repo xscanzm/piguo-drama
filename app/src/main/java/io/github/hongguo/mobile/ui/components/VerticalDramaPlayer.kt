@@ -71,6 +71,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -89,6 +90,8 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import io.github.hongguo.mobile.core.FullscreenButtonAnchor
+import io.github.hongguo.mobile.core.computeFullscreenButtonPlacement
 import io.github.hongguo.mobile.core.computeVideoViewportSize
 import io.github.hongguo.mobile.player.ExoPlayerPool
 import io.github.hongguo.mobile.player.MediaCacheManager
@@ -128,6 +131,8 @@ fun VerticalDramaPlayer(
     onFlushProgress: () -> Unit = {},
     showSeekBar: Boolean = true,
     showFullscreenHint: Boolean = true,
+    topSafeClearanceDp: Dp = 64.dp,
+    bottomOverlayClearanceDp: Dp = 240.dp,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -606,36 +611,54 @@ fun VerticalDramaPlayer(
             }
         }
 
-        // "全屏观看" button placed right below centered landscape video frame
+        // "全屏观看" button placed without colliding with top bar or bottom overlay at any resolution
         if (!isInPipMode && isLandscapeVideo && !isFullscreen && showFullscreenHint && mediaSource != null && playerError == null) {
-            val videoRenderedH = (containerW * videoHeight / videoWidth).coerceAtMost(containerH)
-            val buttonTop = ((containerH + videoRenderedH) / 2) + 14.dp
-            if (buttonTop + 40.dp < containerH) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = buttonTop)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0xFF1F1F24).copy(alpha = 0.88f))
-                        .border(0.8.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(18.dp))
-                        .clickable { onToggleFullscreen(true) }
-                        .padding(horizontal = 14.dp, vertical = 7.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Fullscreen,
-                        contentDescription = "全屏观看",
-                        tint = Color.White,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Text(
-                        text = "全屏观看",
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
+            val fitViewport = computeVideoViewportSize(
+                containerW = boxWpx,
+                containerH = boxHpx,
+                videoW = videoWidth,
+                videoH = videoHeight,
+                pixelRatio = videoPixelRatio,
+                cropToFill = false
+            )
+            val videoRenderedHDp = with(density) { fitViewport.heightPx.toDp() }
+            val placement = computeFullscreenButtonPlacement(
+                containerHDp = containerH.value,
+                videoRenderedHDp = videoRenderedHDp.value,
+                topBarClearanceDp = topSafeClearanceDp.value,
+                bottomOverlayClearanceDp = bottomOverlayClearanceDp.value
+            )
+            val buttonModifier = when (placement.anchor) {
+                FullscreenButtonAnchor.BELOW_VIDEO,
+                FullscreenButtonAnchor.ABOVE_VIDEO -> Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = placement.topOffsetDp.dp)
+                FullscreenButtonAnchor.INSIDE_VIDEO_TOP_END -> Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = placement.topOffsetDp.dp, end = 12.dp)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                modifier = buttonModifier
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xFF1F1F24).copy(alpha = 0.88f))
+                    .border(0.8.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(18.dp))
+                    .clickable { onToggleFullscreen(true) }
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Fullscreen,
+                    contentDescription = "全屏观看",
+                    tint = Color.White,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "全屏观看",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
         }
 

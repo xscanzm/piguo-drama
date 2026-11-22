@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items as rowItems
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -46,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaQualityEvaluator.formatCompactCount
 import io.github.hongguo.mobile.core.QualityPreference
+import io.github.hongguo.mobile.core.SeriesSeasonItem
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
 import io.github.hongguo.mobile.player.SleepTimerState
@@ -61,6 +63,8 @@ fun EpisodePickerSheet(
     detail: DramaDetail,
     currentEpisodeIndex: Int,
     watchedUpToEpisode: Int = 0,
+    seasons: List<SeriesSeasonItem> = emptyList(),
+    onSwitchSeason: ((String) -> Unit)? = null,
     onSelectEpisode: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -131,6 +135,48 @@ fun EpisodePickerSheet(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+
+            if (seasons.size >= 2 && onSwitchSeason != null) {
+                Spacer(Modifier.height(10.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    item {
+                        Text(
+                            text = "系列换季",
+                            color = TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    rowItems(seasons, key = { it.summary.seriesId }) { item ->
+                        val epText = if (item.summary.episodeCount > 0) " · ${item.summary.episodeCount}集" else ""
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(if (item.isCurrent) CoralRed.copy(alpha = 0.2f) else SurfaceElevated)
+                                .border(
+                                    1.dp,
+                                    if (item.isCurrent) CoralRed else Color.White.copy(alpha = 0.08f),
+                                    RoundedCornerShape(14.dp)
+                                )
+                                .clickable(enabled = !item.isCurrent) {
+                                    onSwitchSeason(item.summary.seriesId)
+                                    onDismiss()
+                                }
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Text(
+                                text = "${item.displayLabel}$epText",
+                                color = if (item.isCurrent) CoralRed else TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = if (item.isCurrent) FontWeight.Bold else FontWeight.Medium
+                            )
+                        }
+                    }
+                }
             }
 
             if (hotEpisodes.isNotEmpty()) {

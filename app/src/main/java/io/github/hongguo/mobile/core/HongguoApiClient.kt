@@ -79,6 +79,7 @@ class HongguoApiClient(
     private val prefetchedVariantsCache = ConcurrentHashMap<String, Pair<Long, List<PlayVariant>>>()
     private val catalogGenres = ConcurrentHashMap<String, List<GenreItem>>()
     private val detailCache = ConcurrentHashMap<String, Pair<Long, DramaDetail>>()
+    private val seasonSearchCache = ConcurrentHashMap<String, Pair<Long, List<DramaSummary>>>()
 
     private fun currentCookieHeader(): String? =
         authSessionProvider()?.cookieHeader?.takeIf { it.isNotBlank() }
@@ -1269,6 +1270,30 @@ class HongguoApiClient(
         if (detail.seriesId.isNotBlank() && detail.episodes.isNotEmpty()) {
             detailCache.putIfAbsent(detail.seriesId, (System.currentTimeMillis() + 300_000L) to detail)
         }
+    }
+
+    fun peekSeriesSeasons(current: DramaSummary): List<SeriesSeasonItem>? {
+        val parsed = SeriesSeasonMatcher.parseTitle(current.title)
+        if (parsed.normalizedBase.length < 2) return emptyList()
+        val cached = seasonSearchCache[parsed.normalizedBase] ?: return null
+        if (cached.first <= System.currentTimeMillis()) return null
+        return SeriesSeasonMatcher.matchAndSortSeasons(current, cached.second)
+    }
+
+    suspend fun fetchSeriesSeasons(current: DramaSummary): List<SeriesSeasonItem> {
+        val parsed = SeriesSeasonMatcher.parseTitle(current.title)
+        if (parsed.normalizedBase.length < 2) return emptyList()
+        val cached = seasonSearchCache[parsed.normalizedBase]
+        if (cached != null && cached.first > System.currentTimeMillis()) {
+            return SeriesSeasonMatcher.matchAndSortSeasons(current, cached.second)
+        }
+        val results = runCatching {
+            searchDramas(keyword = parsed.baseTitle, page = 1).items
+        }.getOrElse {
+            return emptyList()
+        }
+        seasonSearchCache[parsed.normalizedBase] = (System.currentTimeMillis() + 600_000L) to results
+        return SeriesSeasonMatcher.matchAndSortSeasons(current, results)
     }
 
     suspend fun fetchSeriesDetail(seriesId: String, forceRefresh: Boolean = false): DramaDetail = withContext(Dispatchers.IO) {
