@@ -26,7 +26,18 @@ data class MetadataSignedRequest(
 object LegacySigner {
     const val VIDEO_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
     const val PLAYER_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1"
+    const val CURRENT_PLAYBACK_HOST = "reading.snssdk.com"
+    const val PRELOAD_PLAYBACK_PATH = "/novel/player/multi_video_model/preload/v1"
     const val SEARCH_API = "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v"
+
+    val PRELOAD_PLAYBACK_HOSTS = listOf(
+        "reading.snssdk.com",
+        "api5-normal-sinfonlinea.fqnovel.com",
+        "api5-normal-sinfonlineb.fqnovel.com",
+        "api5-normal-sinfonlinec.fqnovel.com",
+        "api5-normal-lq.fqnovel.com",
+        "api3-normal-lf.fqnovel.com"
+    )
 
     val PLAYBACK_HOSTS = listOf(
         "api5-normal-sinfonlineb.fqnovel.com",
@@ -1019,37 +1030,73 @@ object LegacySigner {
         return ByteHelpers.base64Encode(ByteHelpers.concat(randomBytes, out))
     }
 
+    private fun v5ProfileParams(
+        identity: DeviceIdentity,
+        currentAppProfile: Boolean
+    ): LinkedHashMap<String, String> = if (currentAppProfile) {
+        linkedMapOf(
+            "aid" to "8662",
+            "app_name" to "novelread",
+            "version_code" to "74532",
+            "version_name" to "7.4.5.32",
+            "update_version_code" to "74532",
+            "manifest_version_code" to "74532",
+            "os" to "android",
+            "ssmix" to "a",
+            "channel" to "update_64",
+            "device_platform" to "android",
+            "device_type" to "25053RT47C",
+            "device_brand" to "Redmi",
+            "os_version" to "16",
+            "os_api" to "36",
+            "ac" to "wifi",
+            "language" to "zh",
+            "host_abi" to "arm64-v8a",
+            "iid" to identity.iid,
+            "cdid" to identity.cdid,
+            "device_id" to identity.deviceId
+        )
+    } else {
+        linkedMapOf(
+            "aid" to "8662",
+            "app_name" to "novelread",
+            "version_code" to "74332",
+            "version_name" to "7.4.3.32",
+            "channel" to "vivo_8662_64",
+            "device_platform" to "android",
+            "device_type" to "PGT-AN10",
+            "os_version" to "12",
+            "update_version_code" to "74332",
+            "iid" to identity.iid,
+            "cdid" to identity.cdid,
+            "device_id" to identity.deviceId
+        )
+    }
+
     fun buildV5PlaybackRequest(
         payloadJson: String,
         identity: DeviceIdentity,
         alternateHost: Boolean = false,
         hostOverride: String? = null,
         cookieHeader: String? = null,
-        apiPath: String = "/novel/player/multi_video_model/v1/"
+        apiPath: String = "/novel/player/multi_video_model/v1/",
+        currentAppProfile: Boolean = true
     ): MetadataSignedRequest {
         val gzipBody = ByteHelpers.gzip(payloadJson.toByteArray(StandardCharsets.UTF_8))
         val targetHost = hostOverride ?: if (alternateHost) "api5-normal-sinfonlinea.fqnovel.com" else "api5-normal-sinfonlineb.fqnovel.com"
         val base = "https://$targetHost$apiPath"
         val signed = PlaybackV5Signer.sign(
             baseUrl = base,
-            values = linkedMapOf(
-                "aid" to "8662",
-                "app_name" to "novelread",
-                "version_code" to "74332",
-                "version_name" to "7.4.3.32",
-                "channel" to "vivo_8662_64",
-                "device_platform" to "android",
-                "device_type" to "PGT-AN10",
-                "os_version" to "12",
-                "update_version_code" to "74332",
-                "iid" to identity.iid,
-                "cdid" to identity.cdid,
-                "device_id" to identity.deviceId
-            ),
+            values = v5ProfileParams(identity, currentAppProfile),
             gzipBody = gzipBody
         )
+        val userAgent = if (currentAppProfile && apiPath == PRELOAD_PLAYBACK_PATH) {
+            System.getProperty("http.agent")?.takeIf { it.isNotBlank() } ?: "okhttp/4.12.0"
+        } else {
+            PLAYBACK_UA
+        }
         val headers = LinkedHashMap(signed.headers).apply {
-            this["User-Agent"] = PLAYBACK_UA
+            this["User-Agent"] = userAgent
             this["Accept"] = "application/json"
             this["Content-Type"] = "application/json; charset=utf-8"
             this["Content-Encoding"] = "gzip"
@@ -1067,36 +1114,26 @@ object LegacySigner {
         cookieHeader: String? = null
     ): MetadataSignedRequest {
         val base = "https://$hostOverride/reading/bookapi/video_tab/multi_video_model/v1/"
+        val values = v5ProfileParams(identity, currentAppProfile = true).apply {
+            this["video_id"] = vid
+            this["video_id_type"] = "0"
+            this["device_level"] = "1"
+            this["need_all_video_definition"] = "1"
+            this["need_mp4_align"] = "0"
+            this["use_os_player"] = "0"
+            this["video_platform"] = "1024"
+            this["source"] = "0"
+            this["from_video_id"] = ""
+        }
         val signed = PlaybackV5Signer.sign(
             baseUrl = base,
-            values = linkedMapOf(
-                "aid" to "8662",
-                "app_name" to "novelread",
-                "version_code" to "74332",
-                "version_name" to "7.4.3.32",
-                "channel" to "vivo_8662_64",
-                "device_platform" to "android",
-                "device_type" to "PGT-AN10",
-                "os_version" to "12",
-                "update_version_code" to "74332",
-                "iid" to identity.iid,
-                "cdid" to identity.cdid,
-                "device_id" to identity.deviceId,
-                "video_id" to vid,
-                "video_id_type" to "0",
-                "device_level" to "1",
-                "need_all_video_definition" to "1",
-                "need_mp4_align" to "0",
-                "use_os_player" to "0",
-                "video_platform" to "1024",
-                "source" to "0",
-                "from_video_id" to ""
-            ),
+            values = values,
             gzipBody = null
         )
         val headers = LinkedHashMap(signed.headers).apply {
             this["User-Agent"] = VIDEO_UA.replace("71332", "73932")
-            this["Accept"] = "application/json"
+            this["Accept"] = "application/json; charset=utf-8"
+            this["Accept-Language"] = "zh-CN,zh;q=0.9"
             if (!cookieHeader.isNullOrBlank()) {
                 this["Cookie"] = cookieHeader
             }

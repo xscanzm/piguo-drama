@@ -13,6 +13,7 @@ data class SignedRequest(
 )
 
 object PlaybackV5Signer {
+    const val FIELD_21: Long = 312L
     private val PROCESS_NONCE = ByteHelpers.base64UrlNoPadding(ByteHelpers.randomBytes(18))
     private val PROCESS_STARTED = System.currentTimeMillis()
     private val MAGIC = ByteHelpers.hexToBytes("2d4b4fca49750d433fb5ae2c226dcc56")
@@ -351,7 +352,7 @@ object PlaybackV5Signer {
             .putBytes(15, nested15)
             .putSint(17, ts.toLong())
             .putString(20, "none")
-            .putSint(21, 377)
+            .putSint(21, FIELD_21)
             .putBytes(23, env)
             .putString(24, """{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}""")
             .toByteArray()

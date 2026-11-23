@@ -255,6 +255,7 @@ class ProtocolParityTest {
         val req = LegacySigner.buildV5VideoTabRequest(vid = "7680666554572229656", identity = identity)
 
         assertTrue(req.url.contains("https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/?"))
+        assertTrue(req.url.contains("version_code=74532"))
         assertTrue(req.url.contains("video_id=7680666554572229656"))
         assertNull(req.body)
         assertTrue(!req.headers["x-khronos"].isNullOrEmpty())
@@ -266,5 +267,29 @@ class ProtocolParityTest {
         assertNull(req.headers["x-ss-req-ticket"])
         assertNull(req.headers["Content-Type"])
         assertNull(req.headers["Content-Encoding"])
+    }
+
+    @Test
+    fun v5PreloadPlaybackUsesField21Of312AndCurrentAppProfile() {
+        assertEquals(312L, PlaybackV5Signer.FIELD_21)
+        val identity = DeviceIdentity("9876543210", "1234567890", "11111111-1111-4111-8111-111111111111")
+        val payload = """{"biz_param":{"device_level":2},"mixed_video_id_map":{"1004":["7671977933363235864"]},"dr_scene":"preload"}"""
+
+        val req = LegacySigner.buildV5PlaybackRequest(
+            payloadJson = payload,
+            identity = identity,
+            hostOverride = LegacySigner.CURRENT_PLAYBACK_HOST,
+            cookieHeader = null,
+            apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
+            currentAppProfile = true
+        )
+        assertTrue(req.url.startsWith("https://reading.snssdk.com/novel/player/multi_video_model/preload/v1?"))
+        assertTrue(req.url.contains("version_code=74532"))
+        assertTrue(req.url.contains("version_name=7.4.5.32"))
+        assertTrue(!req.headers["x-medusa"].isNullOrEmpty())
+        assertTrue(!req.headers["x-helios"].isNullOrEmpty())
+        assertTrue(!req.headers["x-khronos"].isNullOrEmpty())
+        assertTrue(!req.headers["x-ss-stub"].isNullOrEmpty())
+        assertNull(req.headers["Cookie"])
     }
 }
