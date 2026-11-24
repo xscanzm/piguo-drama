@@ -1745,6 +1745,23 @@ class HongguoApiClient(
             put("dr_scene", drScene)
         }.toString()
 
+        val singleVideoModelPayload = JSONObject().apply {
+            put("biz_param", JSONObject().apply {
+                put("detail_page_version", 0)
+                put("device_level", 3)
+                put("disable_digg_stat", false)
+                put("from_video_id", "")
+                put("need_all_video_definition", true)
+                put("need_mp4_align", false)
+                put("source", 9)
+                put("use_os_player", false)
+                put("use_server_dns", false)
+                put("video_platform", 3)
+            })
+            put("content_type", 1004)
+            put("video_id", vid)
+        }.toString()
+
         val preloadPayload = buildPlayPayload(deviceLevel = 2, drScene = "preload")
         val playerPayload = buildPlayPayload(deviceLevel = 1, drScene = "player")
 
@@ -1754,107 +1771,113 @@ class HongguoApiClient(
         var v5ReturnedDataButUnusable = false
         var refreshedDevice = false
 
-        // Tier 1: Primary V5 POST preload/v1 with current 7.4.5.32 profile (reading.snssdk.com + fallbacks)
+        suspend fun recordPlaybackFailure(
+            e: Exception,
+            allowRefresh: Boolean,
+            refreshOnBizUnavailable: Boolean
+        ) {
+            if (e !is EmptyResponseException || lastErr == null) {
+                lastErr = e
+            }
+            if (e !is EmptyResponseException && e !is java.io.IOException &&
+                e.message?.contains("(110001)") != true
+            ) {
+                v5ReturnedDataButUnusable = true
+            }
+            val shouldRefresh = allowRefresh && !refreshedDevice && (
+                e is EmptyResponseException ||
+                    (refreshOnBizUnavailable && e.message?.contains("接口暂未提供") == true)
+                )
+            if (shouldRefresh) {
+                refreshedDevice = true
+                runCatching {
+                    identity = registrar.getOrRegister(forceFresh = true, bypassCooldown = true)
+                }
+                delay(300L)
+            }
+        }
+
+        // Tier 1: Primary V5 POST /novel/player/video_model/v1/ with 7.4.5.32 profile
         for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(4)) {
             try {
                 val signed = LegacySigner.buildV5PlaybackRequest(
-                    payloadJson = preloadPayload,
+                    payloadJson = singleVideoModelPayload,
                     identity = identity,
                     hostOverride = host,
                     cookieHeader = null,
-                    apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
+                    apiPath = LegacySigner.VIDEO_MODEL_PATH,
                     currentAppProfile = true
                 )
                 val resp = executeSignedJson(signed, method = "POST", timeoutMs = 10_000L)
                 return@withContext resolvePlayResponse(resp, vid, preferredQuality)
             } catch (e: Exception) {
-                lastErr = e
-                if (e !is EmptyResponseException && e !is java.io.IOException &&
-                    e.message?.contains("(110001)") != true
-                ) {
-                    v5ReturnedDataButUnusable = true
-                }
-                if (!refreshedDevice &&
-                    (e is EmptyResponseException || e.message?.contains("接口暂未提供") == true)
-                ) {
-                    refreshedDevice = true
-                    runCatching {
-                        identity = registrar.getOrRegister(forceFresh = true, bypassCooldown = true)
-                    }
-                    delay(300L)
-                }
+                recordPlaybackFailure(e, allowRefresh = true, refreshOnBizUnavailable = true)
             }
         }
 
-        // Tier 2: Bodyless V5 GET on video_tab across healthy hosts
-        for (host in LegacySigner.VIDEO_TAB_HOSTS.take(4)) {
-            try {
-                val signed = LegacySigner.buildV5VideoTabRequest(
-                    vid = vid,
-                    identity = identity,
-                    hostOverride = host,
-                    cookieHeader = null
-                )
-                val resp = executeSignedJson(signed, method = "GET", timeoutMs = 10_000L)
-                return@withContext resolvePlayResponse(resp, vid, preferredQuality)
-            } catch (e: Exception) {
-                lastErr = e
-                if (e !is EmptyResponseException && e !is java.io.IOException &&
-                    e.message?.contains("(110001)") != true
-                ) {
-                    v5ReturnedDataButUnusable = true
-                }
-                if (!refreshedDevice &&
-                    (e is EmptyResponseException || e.message?.contains("接口暂未提供") == true)
-                ) {
-                    refreshedDevice = true
-                    runCatching {
-                        identity = registrar.getOrRegister(forceFresh = true, bypassCooldown = true)
-                    }
-                    delay(300L)
-                }
-            }
-        }
-
-        // Tier 3: V5 POST player/v1 and multi_video_model/v1 fallback (only when Tier 1 & 2 suffered empty/transient errors)
+        // Tier 2: V5 GET /novel/player/video_model/v1/ single-video fallback
         if (!v5ReturnedDataButUnusable) {
-            val postFallbacks = listOf(
-                "/novel/player/multi_video_model/player/v1" to LegacySigner.CURRENT_PLAYBACK_HOST,
-                "/novel/player/multi_video_model/v1/" to LegacySigner.PLAYBACK_HOSTS[0],
-                "/novel/player/multi_video_model/v1/" to LegacySigner.PLAYBACK_HOSTS[1]
-            )
-            for ((path, host) in postFallbacks) {
+            for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(3)) {
+                try {
+                    val signed = LegacySigner.buildV5SingleVideoModelGetRequest(
+                        vid = vid,
+                        identity = identity,
+                        hostOverride = host,
+                        cookieHeader = null
+                    )
+                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 10_000L)
+                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                } catch (e: Exception) {
+                    recordPlaybackFailure(e, allowRefresh = true, refreshOnBizUnavailable = false)
+                }
+            }
+        }
+
+        // Tier 3: V5 POST preload/v1 fallback
+        if (!v5ReturnedDataButUnusable) {
+            for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(2)) {
                 try {
                     val signed = LegacySigner.buildV5PlaybackRequest(
-                        payloadJson = playerPayload,
+                        payloadJson = preloadPayload,
                         identity = identity,
                         hostOverride = host,
                         cookieHeader = null,
-                        apiPath = path,
+                        apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
                         currentAppProfile = true
                     )
                     val resp = executeSignedJson(signed, method = "POST", timeoutMs = 10_000L)
                     return@withContext resolvePlayResponse(resp, vid, preferredQuality)
                 } catch (e: Exception) {
-                    if (e !is EmptyResponseException && e !is java.io.IOException &&
-                        e.message?.contains("(110001)") != true
-                    ) {
-                        v5ReturnedDataButUnusable = true
-                    }
-                    if (e !is EmptyResponseException || lastErr == null) {
-                        lastErr = e
-                    }
+                    recordPlaybackFailure(e, allowRefresh = false, refreshOnBizUnavailable = false)
                 }
             }
         }
 
-        // Tier 4: Official Web Direct MP4 (rescues ByteVC2-only / App rate-limit / missing metadata)
+        // Tier 4: Bodyless V5 GET on video_tab fallback
+        if (!v5ReturnedDataButUnusable) {
+            for (host in LegacySigner.VIDEO_TAB_HOSTS.take(2)) {
+                try {
+                    val signed = LegacySigner.buildV5VideoTabRequest(
+                        vid = vid,
+                        identity = identity,
+                        hostOverride = host,
+                        cookieHeader = null
+                    )
+                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 10_000L)
+                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                } catch (e: Exception) {
+                    recordPlaybackFailure(e, allowRefresh = false, refreshOnBizUnavailable = false)
+                }
+            }
+        }
+
+        // Tier 5: Official Web Direct MP4 (rescues ByteVC2-only / App rate-limit / missing metadata)
         val webVariant = runCatching { fetchPlayUrlFromWeb(vid, seriesId) }.getOrNull()
         if (webVariant != null) {
             return@withContext EpisodePlayResult(vid = vid, variants = listOf(webVariant))
         }
 
-        // Tier 5: App Legacy API only if V5 suffered transport/empty failures (avoid masking real business/codec errors)
+        // Tier 6: App Legacy API only if V5 suffered transport/empty failures (avoid masking real business/codec errors)
         if (!v5ReturnedDataButUnusable) {
             for (host in LegacySigner.PLAYBACK_HOSTS.take(2)) {
                 try {
@@ -1879,7 +1902,7 @@ class HongguoApiClient(
         throw (lastErr ?: IllegalStateException("本集暂无可用片源"))
     }
 
-    private fun resolvePlayResponse(
+    internal fun resolvePlayResponse(
         resp: JSONObject,
         vid: String,
         preferredQuality: QualityPreference
@@ -1889,9 +1912,12 @@ class HongguoApiClient(
             error("接口暂未提供本集播放信息 ($bizCode)")
         }
         val dataObj = resp.optJSONObject("data") ?: error("播放响应缺少 data")
-        val entries = dataObj.optJSONObject("1004") ?: dataObj.optJSONObject("video_model_data") ?: dataObj
-        val entry = entries.optJSONObject(vid) ?: error("未返回所选分集信息")
-        val modelRaw = entry.opt("video_model")
+        val modelRaw = dataObj.opt("video_model")?.takeIf { it != JSONObject.NULL }
+            ?: run {
+                val entries = dataObj.optJSONObject("1004") ?: dataObj.optJSONObject("video_model_data") ?: dataObj
+                val entry = entries.optJSONObject(vid) ?: error("未返回所选分集信息")
+                entry.opt("video_model")
+            }
         val model = when (modelRaw) {
             is JSONObject -> modelRaw
             is String -> JSONObject(modelRaw)
@@ -1937,7 +1963,11 @@ class HongguoApiClient(
         var lastErr: Exception? = cause
         for (url in candidates) {
             try {
-                val rawText = executePlainGetText(url, mapOf("Accept" to "application/json"), timeoutMs = 10_000L)
+                val rawText = executePlainGetText(
+                    url,
+                    mapOf("Accept" to "application/json", "User-Agent" to LegacySigner.VIDEO_UA),
+                    timeoutMs = 10_000L
+                )
                 if (rawText.isBlank()) continue
                 val outer = JSONObject(rawText)
                 val info = outer.optJSONObject("video_info")?.optJSONObject("data") ?: continue

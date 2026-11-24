@@ -60,7 +60,7 @@
 ## 下载与安装
 
 - **系统要求**：Android 8.0 及以上手机
-- **下载方式**：打开 [Releases 发布页](https://github.com/xscanzm/piguo-drama/releases/latest) → 下载 `piguo-drama-v1.2.5.apk`（文件名 `app-release.apk`，仅约 `3.7 MB`）安装即可使用。
+- **下载方式**：打开 [Releases 发布页](https://github.com/xscanzm/piguo-drama/releases/latest) → 下载 `piguo-drama-v1.2.6.apk`（文件名 `app-release.apk`，仅约 `3.7 MB`）安装即可使用。
 
 ---
 

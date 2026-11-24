@@ -28,6 +28,7 @@ object LegacySigner {
     const val PLAYER_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1"
     const val CURRENT_PLAYBACK_HOST = "reading.snssdk.com"
     const val PRELOAD_PLAYBACK_PATH = "/novel/player/multi_video_model/preload/v1"
+    const val VIDEO_MODEL_PATH = "/novel/player/video_model/v1/"
     const val SEARCH_API = "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v"
 
     val PRELOAD_PLAYBACK_HOSTS = listOf(
@@ -1091,7 +1092,7 @@ object LegacySigner {
             gzipBody = gzipBody
         )
         val userAgent = if (currentAppProfile && apiPath == PRELOAD_PLAYBACK_PATH) {
-            System.getProperty("http.agent")?.takeIf { it.isNotBlank() } ?: "okhttp/4.12.0"
+            "okhttp/4.12.0"
         } else {
             PLAYBACK_UA
         }
@@ -1105,6 +1106,38 @@ object LegacySigner {
             }
         }
         return MetadataSignedRequest(signed.url, headers, gzipBody)
+    }
+
+    fun buildV5SingleVideoModelGetRequest(
+        vid: String,
+        identity: DeviceIdentity,
+        hostOverride: String = CURRENT_PLAYBACK_HOST,
+        cookieHeader: String? = null
+    ): MetadataSignedRequest {
+        val base = "https://$hostOverride$VIDEO_MODEL_PATH"
+        val values = v5ProfileParams(identity, currentAppProfile = true).apply {
+            this["video_id"] = vid
+            this["video_id_type"] = "0"
+            this["device_level"] = "1"
+            this["need_all_video_definition"] = "1"
+            this["need_mp4_align"] = "0"
+            this["use_os_player"] = "0"
+            this["video_platform"] = "1024"
+            this["source"] = "0"
+        }
+        val signed = PlaybackV5Signer.sign(
+            baseUrl = base,
+            values = values,
+            gzipBody = null
+        )
+        val headers = LinkedHashMap(signed.headers).apply {
+            this["User-Agent"] = PLAYBACK_UA
+            this["Accept"] = "application/json"
+            if (!cookieHeader.isNullOrBlank()) {
+                this["Cookie"] = cookieHeader
+            }
+        }
+        return MetadataSignedRequest(signed.url, headers, null)
     }
 
     fun buildV5VideoTabRequest(

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package io.github.hongguo.mobile.core
 
+import okhttp3.OkHttpClient
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -291,5 +293,160 @@ class ProtocolParityTest {
         assertTrue(!req.headers["x-khronos"].isNullOrEmpty())
         assertTrue(!req.headers["x-ss-stub"].isNullOrEmpty())
         assertNull(req.headers["Cookie"])
+    }
+
+    private fun buildSyntheticSpadeA(keyHex: String): String {
+        val plain = ByteArray(33)
+        plain[0] = 'x'.code.toByte()
+        System.arraycopy(keyHex.toByteArray(StandardCharsets.US_ASCII), 0, plain, 1, 32)
+        val raw = ByteArray(34)
+        var a = 85
+        var b = 246
+        for (i in 0 until 33) {
+            val previous = if ((i and 1) != 0) a else b
+            val pop = Integer.bitCount(i)
+            val target = plain[i].toInt() and 0xFF
+            val old = (previous xor ((target + 21 + pop) and 0xFF)) and 0xFF
+            if ((i and 1) != 0) a = old else b = old
+            raw[i + 1] = old.toByte()
+        }
+        raw[0] = ((raw[1].toInt() and 0xFF) xor (raw[2].toInt() and 0xFF)).toByte()
+        return ByteHelpers.base64Encode(raw)
+    }
+
+    @Test
+    fun v5SingleVideoModelPostAndGetRequestsUse74532ProfileAndStableUa() {
+        val identity = DeviceIdentity("9876543210", "1234567890", "11111111-1111-4111-8111-111111111111")
+        val vid = "7678630460108327961"
+        val payload = """{"biz_param":{"device_level":3,"source":9,"video_platform":3},"content_type":1004,"video_id":"$vid"}"""
+
+        val postReq = LegacySigner.buildV5PlaybackRequest(
+            payloadJson = payload,
+            identity = identity,
+            hostOverride = LegacySigner.CURRENT_PLAYBACK_HOST,
+            cookieHeader = null,
+            apiPath = LegacySigner.VIDEO_MODEL_PATH,
+            currentAppProfile = true
+        )
+        assertTrue(postReq.url.contains("/novel/player/video_model/v1/?"))
+        assertTrue(postReq.url.contains("version_code=74532"))
+        assertTrue(postReq.url.contains("version_name=7.4.5.32"))
+        assertEquals(LegacySigner.PLAYBACK_UA, postReq.headers["User-Agent"])
+        assertTrue(!postReq.headers["x-medusa"].isNullOrEmpty())
+        assertTrue(!postReq.headers["x-helios"].isNullOrEmpty())
+        assertTrue(!postReq.headers["x-khronos"].isNullOrEmpty())
+        assertTrue(!postReq.headers["x-ss-stub"].isNullOrEmpty())
+        assertNull(postReq.headers["Cookie"])
+
+        val prevHttpAgent = System.getProperty("http.agent")
+        try {
+            System.setProperty("http.agent", "Dalvik/2.1.0 (Linux; U; Android 15; Test)")
+            val preloadReq = LegacySigner.buildV5PlaybackRequest(
+                payloadJson = payload,
+                identity = identity,
+                hostOverride = LegacySigner.CURRENT_PLAYBACK_HOST,
+                cookieHeader = null,
+                apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
+                currentAppProfile = true
+            )
+            assertEquals("okhttp/4.12.0", preloadReq.headers["User-Agent"])
+        } finally {
+            if (prevHttpAgent == null) {
+                System.clearProperty("http.agent")
+            } else {
+                System.setProperty("http.agent", prevHttpAgent)
+            }
+        }
+
+        val getReq = LegacySigner.buildV5SingleVideoModelGetRequest(
+            vid = vid,
+            identity = identity,
+            hostOverride = LegacySigner.CURRENT_PLAYBACK_HOST,
+            cookieHeader = null
+        )
+        assertTrue(getReq.url.contains("/novel/player/video_model/v1/?"))
+        assertTrue(getReq.url.contains("video_id=$vid"))
+        assertTrue(getReq.url.contains("version_code=74532"))
+        assertNull(getReq.body)
+        assertEquals(LegacySigner.PLAYBACK_UA, getReq.headers["User-Agent"])
+        assertTrue(!getReq.headers["x-medusa"].isNullOrEmpty())
+        assertTrue(!getReq.headers["x-helios"].isNullOrEmpty())
+        assertTrue(!getReq.headers["x-khronos"].isNullOrEmpty())
+        assertNull(getReq.headers["Cookie"])
+    }
+
+    @Test
+    fun resolvePlayResponseParsesSingleVideoModelAndMultiVideoModelShapes() {
+        val apiClient = HongguoApiClient(OkHttpClient())
+        val expectedKey = "00112233445566778899aabbccddeeff"
+        val spadeA = buildSyntheticSpadeA(expectedKey)
+        val vid = "7678630460108327961"
+
+        val singleModelJson = """
+            {
+              "video_id": "v02Test",
+              "video_duration": 100.0,
+              "video_list": [
+                {
+                  "video_meta": {
+                    "codec_type": "bytevc2",
+                    "definition": "720p",
+                    "vwidth": 720,
+                    "vheight": 1280
+                  },
+                  "encrypt_info": {
+                    "encrypt": true,
+                    "spade_a": "$spadeA"
+                  },
+                  "main_url": "https://v1.qznovelvod.com/bytevc2.mp4"
+                },
+                {
+                  "video_meta": {
+                    "codec_type": "bytevc1",
+                    "definition": "1080p",
+                    "vwidth": 1080,
+                    "vheight": 1920
+                  },
+                  "encrypt_info": {
+                    "encrypt": true,
+                    "spade_a": "$spadeA"
+                  },
+                  "main_url": "https://v2.qznovelvod.com/hevc1080.mp4",
+                  "backup_url": "https://v3.fqnovelvod.com/hevc1080_bak.mp4"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val singleResp = JSONObject().apply {
+            put("code", 0)
+            put("data", JSONObject().apply {
+                put("video_model", singleModelJson)
+            })
+        }
+        val singleResult = apiClient.resolvePlayResponse(singleResp, vid, QualityPreference.AUTO)
+        assertEquals(vid, singleResult.vid)
+        assertEquals(2, singleResult.variants.size)
+        assertEquals("hevc", singleResult.variants[0].codec)
+        assertEquals("1080p", singleResult.variants[0].quality)
+        assertEquals(expectedKey, singleResult.variants[0].contentKeyHex)
+        assertEquals("https://v2.qznovelvod.com/hevc1080.mp4", singleResult.variants[0].url)
+
+        val multiResp = JSONObject().apply {
+            put("code", 0)
+            put("data", JSONObject().apply {
+                put("1004", JSONObject().apply {
+                    put(vid, JSONObject().apply {
+                        put("video_model", JSONObject(singleModelJson))
+                    })
+                })
+            })
+        }
+        val multiResult = apiClient.resolvePlayResponse(multiResp, vid, QualityPreference.AUTO)
+        assertEquals(vid, multiResult.vid)
+        assertEquals(2, multiResult.variants.size)
+        assertEquals("hevc", multiResult.variants[0].codec)
+        assertEquals("1080p", multiResult.variants[0].quality)
+        assertEquals(expectedKey, multiResult.variants[0].contentKeyHex)
     }
 }
