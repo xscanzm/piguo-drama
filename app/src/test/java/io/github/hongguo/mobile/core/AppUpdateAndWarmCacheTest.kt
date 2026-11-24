@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package io.github.hongguo.mobile.core
 
+import io.github.hongguo.mobile.ui.components.formatDownloadProgressText
+import io.github.hongguo.mobile.ui.components.formatTransferSpeed
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -181,5 +183,66 @@ class AppUpdateAndWarmCacheTest {
         } finally {
             dir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun updateDialogProgressFormattingNeverThrowsOnPercentOrDynamicLabels() {
+        val info = AppUpdateInfo(
+            tagName = "v1.2.4",
+            versionName = "1.2.4",
+            title = "皮果刷剧 v1.2.4",
+            releaseNotes = "",
+            downloadUrl = "https://github.com/xscanzm/piguo-drama/releases/download/v1.2.4/app-release.apk",
+            htmlUrl = "https://github.com/xscanzm/piguo-drama/releases/tag/v1.2.4",
+            assetSizeBytes = 3_894_745L
+        )
+
+        val connecting = UpdateStatus.Downloading(
+            info = info,
+            downloadedBytes = 0L,
+            totalBytes = info.assetSizeBytes,
+            channelLabel = "正在连接 加速线路 1...",
+            speedBytesPerSec = 0L,
+            connecting = true
+        )
+        assertEquals("正在连接 加速线路 1...", formatDownloadProgressText(connecting))
+
+        val partial = UpdateStatus.Downloading(
+            info = info,
+            downloadedBytes = 1_572_864L,
+            totalBytes = 3_894_745L,
+            channelLabel = "加速线路 1",
+            speedBytesPerSec = 512L * 1024L,
+            connecting = false
+        )
+        val partialText = formatDownloadProgressText(partial)
+        assertTrue(partialText.contains("加速线路 1"))
+        assertTrue(partialText.contains("(40%)"))
+        assertTrue(partialText.contains("512 KB/s"))
+
+        val done = UpdateStatus.Downloading(
+            info = info,
+            downloadedBytes = 3_894_745L,
+            totalBytes = 3_894_745L,
+            channelLabel = "GitHub 直连",
+            speedBytesPerSec = 2L * 1024L * 1024L,
+            connecting = false
+        )
+        val doneText = formatDownloadProgressText(done)
+        assertTrue(doneText.contains("(100%)"))
+        assertTrue(doneText.contains("2.0 MB/s"))
+
+        val unknownTotal = UpdateStatus.Downloading(
+            info = info,
+            downloadedBytes = 1_048_576L,
+            totalBytes = 0L,
+            channelLabel = "节点 100%",
+            speedBytesPerSec = 256L * 1024L,
+            connecting = false
+        )
+        val unknownText = formatDownloadProgressText(unknownTotal)
+        assertTrue(unknownText.contains("节点 100%"))
+        assertTrue(unknownText.contains("已下载 1.00 MB"))
+        assertEquals(" · 1 KB/s", formatTransferSpeed(10L))
     }
 }

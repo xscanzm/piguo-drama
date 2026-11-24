@@ -36,14 +36,32 @@ import io.github.hongguo.mobile.ui.theme.SurfaceDark
 import io.github.hongguo.mobile.ui.theme.SurfaceElevated
 import io.github.hongguo.mobile.ui.theme.TextPrimary
 import io.github.hongguo.mobile.ui.theme.TextSecondary
+import java.util.Locale
 
-private fun formatTransferSpeed(bytesPerSec: Long): String {
+internal fun formatTransferSpeed(bytesPerSec: Long): String {
     if (bytesPerSec <= 0L) return ""
     val kb = bytesPerSec / 1024.0
     return if (kb >= 1024.0) {
-        " · %.1f MB/s".format(kb / 1024.0)
+        " · " + String.format(Locale.US, "%.1f MB/s", kb / 1024.0)
     } else {
-        " · %d KB/s".format(kb.toInt().coerceAtLeast(1))
+        " · ${kb.toInt().coerceAtLeast(1)} KB/s"
+    }
+}
+
+internal fun formatDownloadProgressText(status: UpdateStatus.Downloading): String {
+    val downloaded = status.downloadedBytes
+    if (status.connecting || downloaded <= 0L) {
+        return status.channelLabel
+    }
+    val downloadedMb = String.format(Locale.US, "%.2f", downloaded / (1024.0 * 1024.0))
+    val speedSuffix = formatTransferSpeed(status.speedBytesPerSec)
+    val total = status.totalBytes
+    return if (total > 0L) {
+        val totalMb = String.format(Locale.US, "%.2f", total / (1024.0 * 1024.0))
+        val pct = ((downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f) * 100f).toInt()
+        "${status.channelLabel} · $downloadedMb / $totalMb MB ($pct%)$speedSuffix"
+    } else {
+        "${status.channelLabel} · 已下载 $downloadedMb MB$speedSuffix"
     }
 }
 
@@ -67,7 +85,7 @@ fun AppUpdateDialog(
 
     val isDownloading = status is UpdateStatus.Downloading
     val sizeText = if (info.assetSizeBytes > 0L) {
-        "约 %.2f MB".format(info.assetSizeBytes / (1024.0 * 1024.0))
+        "约 " + String.format(Locale.US, "%.2f MB", info.assetSizeBytes / (1024.0 * 1024.0))
     } else ""
 
     AlertDialog(
@@ -127,22 +145,12 @@ fun AppUpdateDialog(
                     is UpdateStatus.Downloading -> {
                         val total = status.totalBytes
                         val downloaded = status.downloadedBytes
-                        val speedSuffix = formatTransferSpeed(status.speedBytesPerSec)
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (status.connecting || downloaded <= 0L || total <= 0L) {
                                 LinearProgressIndicator(
                                     color = CoralRed,
                                     trackColor = SurfaceElevated,
                                     modifier = Modifier.fillMaxWidth()
-                                )
-                                Text(
-                                    text = if (status.connecting || downloaded <= 0L) {
-                                        status.channelLabel
-                                    } else {
-                                        "${status.channelLabel} · 已下载 %.2f MB$speedSuffix".format(downloaded / (1024.0 * 1024.0))
-                                    },
-                                    color = TextSecondary,
-                                    fontSize = 12.sp
                                 )
                             } else {
                                 val pct = (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
@@ -152,15 +160,12 @@ fun AppUpdateDialog(
                                     trackColor = SurfaceElevated,
                                     modifier = Modifier.fillMaxWidth()
                                 )
-                                Text(
-                                    text = "${status.channelLabel} · %.2f / %.2f MB (${(pct * 100).toInt()}%)$speedSuffix".format(
-                                        downloaded / (1024.0 * 1024.0),
-                                        total / (1024.0 * 1024.0)
-                                    ),
-                                    color = TextSecondary,
-                                    fontSize = 12.sp
-                                )
                             }
+                            Text(
+                                text = formatDownloadProgressText(status),
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
                         }
                     }
 
@@ -201,8 +206,11 @@ fun AppUpdateDialog(
         confirmButton = {
             when (status) {
                 is UpdateStatus.Downloading -> {
-                    TextButton(onClick = onCancelDownload) {
-                        Text("取消下载", color = TextSecondary)
+                    Button(
+                        onClick = { onDismiss(false) },
+                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceElevated)
+                    ) {
+                        Text("后台下载", color = Color(0xFF8EC5FF), fontWeight = FontWeight.Medium)
                     }
                 }
 
@@ -236,8 +244,8 @@ fun AppUpdateDialog(
         },
         dismissButton = {
             if (isDownloading) {
-                TextButton(onClick = { onDismiss(false) }) {
-                    Text("后台下载", color = Color(0xFF8EC5FF))
+                TextButton(onClick = onCancelDownload) {
+                    Text("取消下载", color = TextSecondary)
                 }
             } else {
                 TextButton(onClick = { onDismiss(true) }) {
