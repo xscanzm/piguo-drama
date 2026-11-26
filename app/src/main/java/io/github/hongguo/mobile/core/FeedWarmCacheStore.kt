@@ -162,6 +162,6 @@ class FeedWarmCacheStore(
     }
 
     companion object {
-        const val DEFAULT_MAX_ENTRIES = 12
+        const val DEFAULT_MAX_ENTRIES = 16
     }
 }

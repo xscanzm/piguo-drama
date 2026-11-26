@@ -10,6 +10,7 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 
 /**
@@ -29,7 +30,18 @@ class ExoPlayerPool(private val maxPoolSize: Int = 3) {
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                15_000,
+                35_000,
+                600,
+                1_200
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+
         return ExoPlayer.Builder(context.applicationContext)
+            .setLoadControl(loadControl)
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .build()

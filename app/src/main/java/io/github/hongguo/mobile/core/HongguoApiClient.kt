@@ -22,6 +22,144 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+internal fun playVariantPixels(v: PlayVariant): Int {
+    if (v.width > 0 && v.height > 0) return minOf(v.width, v.height)
+    return Regex("\\d+").find(v.quality)?.value?.toIntOrNull() ?: 0
+}
+
+internal fun playVariantCodecRank(codec: String): Int = when (codec.lowercase()) {
+    "h264", "avc", "avc1" -> 0
+    "hevc", "h265", "h265_hvc1", "hvc1", "hev1", "bytevc1" -> 1
+    else -> 2
+}
+
+internal fun rankPlayVariants(
+    variants: List<PlayVariant>,
+    preferredQuality: QualityPreference
+): List<PlayVariant> {
+    if (variants.size <= 1) return variants
+    val targetMinPx = preferredQuality.targetPixels
+    if (preferredQuality == QualityPreference.AUTO || targetMinPx <= 0) {
+        return variants.sortedWith(
+            compareBy<PlayVariant>(
+                { v ->
+                    val px = playVariantPixels(v)
+                    val isWatchable = px == 0 || px > 360
+                    when {
+                        v.contentKeyHex.isNullOrEmpty() && isWatchable -> 0
+                        !v.contentKeyHex.isNullOrEmpty() && isWatchable -> 1
+                        v.contentKeyHex.isNullOrEmpty() -> 2
+                        else -> 3
+                    }
+                },
+                { v -> playVariantCodecRank(v.codec) }
+            ).thenByDescending { playVariantPixels(it) }
+        )
+    }
+    return variants.sortedWith(
+        compareBy<PlayVariant>(
+            { v -> playVariantPixels(v) <= 0 },
+            { v -> kotlin.math.abs(playVariantPixels(v) - targetMinPx) / 240 },
+            { v -> if (v.contentKeyHex.isNullOrEmpty()) 0 else 1 },
+            { v -> kotlin.math.abs(playVariantPixels(v) - targetMinPx) }
+        )
+            .thenByDescending { playVariantPixels(it) >= targetMinPx }
+            .thenBy { playVariantCodecRank(it.codec) }
+    )
+}
+
+internal fun canReusePrefetchedVariants(
+    variants: List<PlayVariant>,
+    preferredQuality: QualityPreference
+): Boolean {
+    if (variants.isEmpty()) return false
+    if (preferredQuality == QualityPreference.AUTO || preferredQuality.targetPixels <= 0) return true
+    val ranked = rankPlayVariants(variants, preferredQuality)
+    val topPx = playVariantPixels(ranked.first())
+    if (topPx > 0 && kotlin.math.abs(topPx - preferredQuality.targetPixels) <= 240) {
+        return true
+    }
+    return variants.map { playVariantPixels(it) }.filter { it > 0 }.distinct().size >= 2
+}
+
+internal class PlaybackHostSelector {
+    private data class HostHealth(
+        val lastSuccessAtMs: Long = 0L,
+        val lastLatencyMs: Long = 0L,
+        val consecutiveFailures: Int = 0,
+        val cooldownUntilMs: Long = 0L
+    )
+
+    private val stats = ConcurrentHashMap<String, HostHealth>()
+
+    fun recordSuccess(host: String, latencyMs: Long, nowMs: Long = System.currentTimeMillis()) {
+        val clean = host.trim()
+        if (clean.isEmpty()) return
+        val clampedLatency = latencyMs.coerceAtLeast(1L)
+        stats.compute(clean) { _, prev ->
+            val ema = if (prev != null && prev.lastSuccessAtMs > 0L) {
+                (prev.lastLatencyMs * 2L + clampedLatency) / 3L
+            } else {
+                clampedLatency
+            }
+            HostHealth(
+                lastSuccessAtMs = nowMs,
+                lastLatencyMs = ema,
+                consecutiveFailures = 0,
+                cooldownUntilMs = 0L
+            )
+        }
+    }
+
+    fun recordFailure(host: String, nowMs: Long = System.currentTimeMillis()) {
+        val clean = host.trim()
+        if (clean.isEmpty()) return
+        stats.compute(clean) { _, prev ->
+            val fails = ((prev?.consecutiveFailures ?: 0) + 1).coerceAtMost(5)
+            val backoffMs = when (fails) {
+                1 -> 30_000L
+                2 -> 60_000L
+                else -> 120_000L
+            }
+            HostHealth(
+                lastSuccessAtMs = prev?.lastSuccessAtMs ?: 0L,
+                lastLatencyMs = prev?.lastLatencyMs ?: Long.MAX_VALUE,
+                consecutiveFailures = fails,
+                cooldownUntilMs = nowMs + backoffMs
+            )
+        }
+    }
+
+    fun orderedHosts(baseHosts: List<String>, limit: Int, nowMs: Long = System.currentTimeMillis()): List<String> {
+        if (baseHosts.isEmpty() || limit <= 0) return emptyList()
+        return baseHosts.distinct().withIndex()
+            .sortedWith { a, b ->
+                val sa = stats[a.value]
+                val sb = stats[b.value]
+                val aCool = (sa?.cooldownUntilMs ?: 0L) > nowMs
+                val bCool = (sb?.cooldownUntilMs ?: 0L) > nowMs
+                if (aCool != bCool) return@sortedWith if (aCool) 1 else -1
+                if (!aCool) {
+                    val aTested = (sa?.lastSuccessAtMs ?: 0L) > 0L
+                    val bTested = (sb?.lastSuccessAtMs ?: 0L) > 0L
+                    if (aTested != bTested) return@sortedWith if (aTested) -1 else 1
+                    if (aTested) {
+                        val latCmp = sa!!.lastLatencyMs.compareTo(sb!!.lastLatencyMs)
+                        if (latCmp != 0) return@sortedWith latCmp
+                    }
+                    return@sortedWith a.index.compareTo(b.index)
+                }
+                val failCmp = (sa?.consecutiveFailures ?: 0).compareTo(sb?.consecutiveFailures ?: 0)
+                if (failCmp != 0) return@sortedWith failCmp
+                val untilCmp = (sa?.cooldownUntilMs ?: 0L).compareTo(sb?.cooldownUntilMs ?: 0L)
+                if (untilCmp != 0) return@sortedWith untilCmp
+                a.index.compareTo(b.index)
+            }
+            .take(limit)
+            .map { it.value }
+    }
+}
+
 class HongguoApiClient(
     val httpClient: OkHttpClient,
     private val ratingCacheFile: java.io.File? = null,
@@ -74,6 +212,8 @@ class HongguoApiClient(
     val ratingCache = OfficialRatingCache(ratingCacheFile)
     private val playbackMutex = Mutex()
     private var playbackReadyAtMs = 0L
+    private val foregroundPlaybackWaiters = java.util.concurrent.atomic.AtomicInteger(0)
+    private val playbackHostSelector = PlaybackHostSelector()
     private val detailThrottleMutex = Mutex()
     @Volatile
     private var detailReadyAtMs = 0L
@@ -1742,20 +1882,39 @@ class HongguoApiClient(
         vid: String,
         preferredQuality: QualityPreference = QualityPreference.AUTO,
         seriesId: String? = null,
-        bypassCooldown: Boolean = false
+        bypassCooldown: Boolean = false,
+        isBackground: Boolean = false
     ): EpisodePlayResult = withContext(Dispatchers.IO) {
         require(Regex("^\\d{1,30}$").matches(vid)) { "分集编号无效" }
         val prefetched = prefetchedVariantsCache[vid]?.takeIf {
             System.currentTimeMillis() - it.first < 4 * 60_000L
         }?.second
-        if (preferredQuality == QualityPreference.AUTO && !bypassCooldown && !prefetched.isNullOrEmpty()) {
-            return@withContext EpisodePlayResult(vid = vid, variants = prefetched)
+        if (!bypassCooldown && !prefetched.isNullOrEmpty() && canReusePrefetchedVariants(prefetched, preferredQuality)) {
+            return@withContext EpisodePlayResult(vid = vid, variants = rankPlayVariants(prefetched, preferredQuality))
         }
 
-        playbackMutex.withLock {
-            val wait = playbackReadyAtMs - System.currentTimeMillis()
-            if (wait > 0) delay(wait)
-            playbackReadyAtMs = System.currentTimeMillis() + 450L
+        if (isBackground) {
+            var waitCycles = 0
+            while (foregroundPlaybackWaiters.get() > 0 && waitCycles < 16) {
+                delay(120L)
+                waitCycles++
+            }
+            playbackMutex.withLock {
+                val wait = playbackReadyAtMs - System.currentTimeMillis()
+                if (wait > 0) delay(wait)
+                playbackReadyAtMs = System.currentTimeMillis() + 500L
+            }
+        } else {
+            foregroundPlaybackWaiters.incrementAndGet()
+            try {
+                playbackMutex.withLock {
+                    val wait = playbackReadyAtMs - System.currentTimeMillis()
+                    if (wait > 0) delay(wait)
+                    playbackReadyAtMs = System.currentTimeMillis() + 250L
+                }
+            } finally {
+                foregroundPlaybackWaiters.decrementAndGet()
+            }
         }
 
         fun buildPlayPayload(deviceLevel: Int, drScene: String): String = JSONObject().apply {
@@ -1829,7 +1988,8 @@ class HongguoApiClient(
         }
 
         // Tier 1: Primary V5 POST /novel/player/video_model/v1/ with 7.4.5.32 profile
-        for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(4)) {
+        for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 4)) {
+            val startMs = System.currentTimeMillis()
             try {
                 val signed = LegacySigner.buildV5PlaybackRequest(
                     payloadJson = singleVideoModelPayload,
@@ -1839,16 +1999,22 @@ class HongguoApiClient(
                     apiPath = LegacySigner.VIDEO_MODEL_PATH,
                     currentAppProfile = true
                 )
-                val resp = executeSignedJson(signed, method = "POST", timeoutMs = 10_000L)
-                return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                val resp = executeSignedJson(signed, method = "POST", timeoutMs = 6_000L)
+                val result = resolvePlayResponse(resp, vid, preferredQuality)
+                playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
+                return@withContext result
             } catch (e: Exception) {
+                if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
+                    playbackHostSelector.recordFailure(host)
+                }
                 recordPlaybackFailure(e, allowRefresh = true, refreshOnBizUnavailable = true)
             }
         }
 
         // Tier 2: V5 GET /novel/player/video_model/v1/ single-video fallback
         if (!v5ReturnedDataButUnusable) {
-            for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(3)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 3)) {
+                val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildV5SingleVideoModelGetRequest(
                         vid = vid,
@@ -1856,9 +2022,14 @@ class HongguoApiClient(
                         hostOverride = host,
                         cookieHeader = null
                     )
-                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 10_000L)
-                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 6_000L)
+                    val result = resolvePlayResponse(resp, vid, preferredQuality)
+                    playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
+                    return@withContext result
                 } catch (e: Exception) {
+                    if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
+                        playbackHostSelector.recordFailure(host)
+                    }
                     recordPlaybackFailure(e, allowRefresh = true, refreshOnBizUnavailable = false)
                 }
             }
@@ -1866,7 +2037,8 @@ class HongguoApiClient(
 
         // Tier 3: V5 POST preload/v1 fallback
         if (!v5ReturnedDataButUnusable) {
-            for (host in LegacySigner.PRELOAD_PLAYBACK_HOSTS.take(2)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 2)) {
+                val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildV5PlaybackRequest(
                         payloadJson = preloadPayload,
@@ -1876,9 +2048,14 @@ class HongguoApiClient(
                         apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
                         currentAppProfile = true
                     )
-                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = 10_000L)
-                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = 6_000L)
+                    val result = resolvePlayResponse(resp, vid, preferredQuality)
+                    playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
+                    return@withContext result
                 } catch (e: Exception) {
+                    if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
+                        playbackHostSelector.recordFailure(host)
+                    }
                     recordPlaybackFailure(e, allowRefresh = false, refreshOnBizUnavailable = false)
                 }
             }
@@ -1886,7 +2063,8 @@ class HongguoApiClient(
 
         // Tier 4: Bodyless V5 GET on video_tab fallback
         if (!v5ReturnedDataButUnusable) {
-            for (host in LegacySigner.VIDEO_TAB_HOSTS.take(2)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.VIDEO_TAB_HOSTS, 2)) {
+                val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildV5VideoTabRequest(
                         vid = vid,
@@ -1894,9 +2072,14 @@ class HongguoApiClient(
                         hostOverride = host,
                         cookieHeader = null
                     )
-                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 10_000L)
-                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 6_000L)
+                    val result = resolvePlayResponse(resp, vid, preferredQuality)
+                    playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
+                    return@withContext result
                 } catch (e: Exception) {
+                    if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
+                        playbackHostSelector.recordFailure(host)
+                    }
                     recordPlaybackFailure(e, allowRefresh = false, refreshOnBizUnavailable = false)
                 }
             }
@@ -1910,7 +2093,8 @@ class HongguoApiClient(
 
         // Tier 6: App Legacy API only if V5 suffered transport/empty failures (avoid masking real business/codec errors)
         if (!v5ReturnedDataButUnusable) {
-            for (host in LegacySigner.PLAYBACK_HOSTS.take(2)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.PLAYBACK_HOSTS, 2)) {
+                val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildLegacyPlaybackRequest(
                         payloadJson = playerPayload,
@@ -1918,16 +2102,21 @@ class HongguoApiClient(
                         hostOverride = host,
                         cookieHeader = null
                     )
-                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = 10_000L)
-                    return@withContext resolvePlayResponse(resp, vid, preferredQuality)
+                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = 6_000L)
+                    val result = resolvePlayResponse(resp, vid, preferredQuality)
+                    playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
+                    return@withContext result
                 } catch (e: Exception) {
+                    if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
+                        playbackHostSelector.recordFailure(host)
+                    }
                     if (e !is EmptyResponseException) lastErr = e
                 }
             }
         }
 
         if (!prefetched.isNullOrEmpty()) {
-            return@withContext EpisodePlayResult(vid = vid, variants = prefetched)
+            return@withContext EpisodePlayResult(vid = vid, variants = rankPlayVariants(prefetched, preferredQuality))
         }
 
         throw (lastErr ?: IllegalStateException("本集暂无可用片源"))
@@ -2202,7 +2391,7 @@ class HongguoApiClient(
             if (incompleteEncryption) throw IncompleteEncryptionException("本集缺少解密元数据")
             error("本集片源地址或密钥无法解析")
         }
-        return EpisodePlayResult(vid = vid, variants = variants)
+        return EpisodePlayResult(vid = vid, variants = rankPlayVariants(variants, preferredQuality))
     }
 
     private class EmptyResponseException(message: String) : RuntimeException(message)

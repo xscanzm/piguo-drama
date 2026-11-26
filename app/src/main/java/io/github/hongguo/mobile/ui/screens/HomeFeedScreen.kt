@@ -87,6 +87,7 @@ import io.github.hongguo.mobile.player.PlaybackRemoteCommand
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
+import io.github.hongguo.mobile.player.computeFeedLowWaterMark
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.components.DarkHorseBadge
 import io.github.hongguo.mobile.ui.components.DramaDetailSheet
@@ -264,6 +265,8 @@ fun HomeFeedScreen(
 
     DisposableEffect(busOwnerId) {
         onDispose {
+            container.mediaCache.pauseRollingFeedPrecache()
+            container.mediaCache.setForegroundPlaybackReady(true)
             container.playbackControlBus.clearIfOwner(busOwnerId)
             container.localStore.flushSeenFeed()
             container.localStore.flushWatchHistory()
@@ -341,11 +344,11 @@ fun HomeFeedScreen(
                 var accumulatedRaw = if (reset) emptyList() else rawFeedItems
                 var localHasMore = true
                 var filteredNow = emptyList<DramaSummary>()
-                val maxFetches = if (reset) 8 else 5
+                val maxFetches = if (reset) 8 else 6
                 val targetSize = when {
-                    reset -> 3
-                    appendFreshFirstPage -> feedItems.size + 3
-                    else -> feedItems.size + 1
+                    reset -> 4
+                    appendFreshFirstPage -> feedItems.size + 8
+                    else -> feedItems.size + 8
                 }
                 for (attempt in 0 until maxFetches) {
                     val res = container.apiClient.fetchRecommendFeed(
@@ -421,9 +424,25 @@ fun HomeFeedScreen(
         }
     }
 
-    // Load more items as user approaches the end of the feed
-    LaunchedEffect(pagerState.currentPage, feedItems.size) {
-        if (feedItems.isNotEmpty() && pagerState.currentPage >= feedItems.size - 3 && hasMore && !feedLoading) {
+    // Proactively keep a deep feed buffer ahead so rolling 15-item precache always has candidates
+    LaunchedEffect(
+        pagerState.currentPage,
+        feedItems.size,
+        hasMore,
+        feedLoading,
+        isRouteVisible,
+        networkStatus.isWifi,
+        settings.preloadNextEpisode,
+        settings.wifiOnlyPreload
+    ) {
+        if (!isRouteVisible || feedItems.isEmpty() || !hasMore || feedLoading) return@LaunchedEffect
+        val remaining = (feedItems.size - 1 - pagerState.currentPage).coerceAtLeast(0)
+        val lowWaterMark = computeFeedLowWaterMark(
+            isWifi = networkStatus.isWifi,
+            wifiOnlyPreload = settings.wifiOnlyPreload,
+            preloadEnabled = settings.preloadNextEpisode
+        )
+        if (remaining < lowWaterMark) {
             loadFeed(reset = false)
         }
     }
@@ -498,28 +517,58 @@ fun HomeFeedScreen(
         container.apiClient.recordSeenRecFilter(channelKey, cur.recFilterInfo)
     }
 
-    // Background pre-cache up to 10 upcoming recommendation videos onto disk for instant cold start
+    // Pause background precache bandwidth competition while foreground playback is starting/buffering
+    LaunchedEffect(isRouteVisible, isCurFeedPlaying, curFeedState?.error) {
+        val foregroundReady = !isRouteVisible || isCurFeedPlaying || curFeedState?.error != null
+        container.mediaCache.setForegroundPlaybackReady(foregroundReady)
+    }
+
+    // Unified rolling precache across all channels (15 items on Wi-Fi / 4 on cellular, tiered full + head)
     LaunchedEffect(
+        isRouteVisible,
         selectedChannelIdx,
         pagerState.currentPage,
         feedItems,
         settings.preloadNextEpisode,
         settings.wifiOnlyPreload,
         settings.quality,
-        settings.cellularAutoLowQuality
+        settings.cellularAutoLowQuality,
+        networkStatus.isWifi
     ) {
-        if (selectedChannelIdx == 0 && feedItems.isNotEmpty()) {
+        if (!isRouteVisible || feedItems.isEmpty()) {
+            container.mediaCache.pauseRollingFeedPrecache()
+        } else {
             val upcomingCandidates = feedItems.drop((pagerState.currentPage + 1).coerceAtMost(feedItems.size))
-            container.mediaCache.scheduleWarmFeedPrecache(
+            container.mediaCache.scheduleRollingFeedPrecache(
+                channelKey = channels[selectedChannelIdx].first.key,
                 candidates = upcomingCandidates,
                 settings = settings,
                 localStore = container.localStore,
-                excludedIds = sessionExcludedIds
+                excludedIds = sessionExcludedIds,
+                persistWarmStore = (selectedChannelIdx == 0),
+                enabled = true,
+                onImmediateNextReady = { readySeriesId, readyMedia, readyDetail, readyEpIdx ->
+                    scope.launch {
+                        val immediateNext = feedItems.getOrNull(pagerState.currentPage + 1)
+                        if (immediateNext?.seriesId == readySeriesId) {
+                            val prev = episodeStates[readySeriesId]
+                            if (prev?.media == null) {
+                                episodeStates[readySeriesId] = FeedEpisodeState(
+                                    detail = prev?.detail ?: readyDetail,
+                                    episodeIndex = readyEpIdx,
+                                    media = readyMedia,
+                                    loading = false,
+                                    error = null
+                                )
+                            }
+                        }
+                    }
+                }
             )
         }
     }
 
-    // Resolve current page's detail & playable video, plus preload next drama's episode
+    // Resolve current page's detail & playable video (sync cache hit first), and pre-prepare adjacent next page
     LaunchedEffect(pagerState.currentPage, feedItems, effectiveQuality, retryTick) {
         if (feedItems.isEmpty()) return@LaunchedEffect
         if (episodeStates.size > 40) {
@@ -532,88 +581,126 @@ fun HomeFeedScreen(
         val curItem = feedItems.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
         val existing = episodeStates[curItem.seriesId]
         if (existing?.media == null && existing?.loading != true) {
-            episodeStates[curItem.seriesId] = (existing ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex))
-                .copy(loading = true, error = null)
-            try {
-                val lastHist = history.firstOrNull { it.seriesId == curItem.seriesId }
-                if (lastHist == null && curItem.initialVid.isNotEmpty() && existing?.detail == null) {
-                    // Fast path: resolve initialVid directly while loading full detail in background
+            val lastHist = history.firstOrNull { it.seriesId == curItem.seriesId }
+            val cachedDetail = existing?.detail ?: container.apiClient.peekSeriesDetail(curItem.seriesId)
+            val quickPeek = if (lastHist == null && curItem.initialVid.isNotEmpty() && retryTick == 0) {
+                container.mediaCache.peekResolvedSource(curItem.initialVid, effectiveQuality)
+            } else null
+            if (quickPeek != null) {
+                val resolvedEpIdx = cachedDetail?.episodes?.firstOrNull { it.vid == curItem.initialVid }?.index
+                    ?: existing?.episodeIndex
+                    ?: curItem.initialEpisodeIndex
+                episodeStates[curItem.seriesId] = FeedEpisodeState(
+                    detail = cachedDetail,
+                    episodeIndex = resolvedEpIdx,
+                    media = quickPeek,
+                    loading = false,
+                    error = null
+                )
+                if (cachedDetail == null) {
                     scope.launch {
                         runCatching {
                             val d = container.apiClient.fetchSeriesDetail(curItem.seriesId)
-                            val resolvedEpIdx = d.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
+                            val epIdx = d.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
                                 ?: curItem.initialEpisodeIndex.coerceIn(1, d.episodes.size.coerceAtLeast(1))
                             episodeStates[curItem.seriesId]?.let { cur ->
-                                episodeStates[curItem.seriesId] = cur.copy(detail = d, episodeIndex = resolvedEpIdx)
+                                episodeStates[curItem.seriesId] = cur.copy(detail = d, episodeIndex = epIdx)
                             }
                         }
                     }
-                    val media = container.mediaCache.resolvePlayableSource(
-                        vid = curItem.initialVid,
-                        quality = effectiveQuality,
-                        seriesId = curItem.seriesId,
-                        bypassCooldown = retryTick > 0
-                    )
-                    val latestState = episodeStates[curItem.seriesId]
-                    val curDetail = latestState?.detail
-                    val resolvedEpIdx = curDetail?.episodes?.firstOrNull { it.vid == curItem.initialVid }?.index
-                        ?: latestState?.episodeIndex
-                        ?: curItem.initialEpisodeIndex
-                    episodeStates[curItem.seriesId] = FeedEpisodeState(
-                        detail = curDetail,
-                        episodeIndex = resolvedEpIdx,
-                        media = media,
-                        loading = false,
-                        error = null
-                    )
-                } else {
-                    val detail = existing?.detail ?: container.apiClient.fetchSeriesDetail(curItem.seriesId)
-                    val epIdx = (
-                        lastHist?.lastEpisodeIndex
-                            ?: detail.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
-                            ?: existing?.episodeIndex
+                }
+            } else {
+                episodeStates[curItem.seriesId] = (existing ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex))
+                    .copy(loading = true, error = null)
+                try {
+                    if (lastHist == null && curItem.initialVid.isNotEmpty() && existing?.detail == null) {
+                        // Fast path: resolve initialVid directly while loading full detail in background
+                        scope.launch {
+                            runCatching {
+                                val d = container.apiClient.fetchSeriesDetail(curItem.seriesId)
+                                val resolvedEpIdx = d.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
+                                    ?: curItem.initialEpisodeIndex.coerceIn(1, d.episodes.size.coerceAtLeast(1))
+                                episodeStates[curItem.seriesId]?.let { cur ->
+                                    episodeStates[curItem.seriesId] = cur.copy(detail = d, episodeIndex = resolvedEpIdx)
+                                }
+                            }
+                        }
+                        val media = container.mediaCache.resolvePlayableSource(
+                            vid = curItem.initialVid,
+                            quality = effectiveQuality,
+                            seriesId = curItem.seriesId,
+                            bypassCooldown = retryTick > 0
+                        )
+                        val latestState = episodeStates[curItem.seriesId]
+                        val curDetail = latestState?.detail
+                        val resolvedEpIdx = curDetail?.episodes?.firstOrNull { it.vid == curItem.initialVid }?.index
+                            ?: latestState?.episodeIndex
                             ?: curItem.initialEpisodeIndex
-                        ).coerceIn(1, detail.episodes.size.coerceAtLeast(1))
-                    val vid = detail.episodes[epIdx - 1].vid
-                    val media = container.mediaCache.resolvePlayableSource(
-                        vid = vid,
-                        quality = effectiveQuality,
-                        seriesId = curItem.seriesId,
-                        bypassCooldown = retryTick > 0
-                    )
-                    episodeStates[curItem.seriesId] = FeedEpisodeState(
-                        detail = detail,
-                        episodeIndex = epIdx,
-                        media = media,
+                        episodeStates[curItem.seriesId] = FeedEpisodeState(
+                            detail = curDetail,
+                            episodeIndex = resolvedEpIdx,
+                            media = media,
+                            loading = false,
+                            error = null
+                        )
+                    } else {
+                        val detail = existing?.detail ?: container.apiClient.fetchSeriesDetail(curItem.seriesId)
+                        val epIdx = (
+                            lastHist?.lastEpisodeIndex
+                                ?: detail.episodes.firstOrNull { it.vid == curItem.initialVid }?.index
+                                ?: existing?.episodeIndex
+                                ?: curItem.initialEpisodeIndex
+                            ).coerceIn(1, detail.episodes.size.coerceAtLeast(1))
+                        val vid = detail.episodes[epIdx - 1].vid
+                        val media = container.mediaCache.resolvePlayableSource(
+                            vid = vid,
+                            quality = effectiveQuality,
+                            seriesId = curItem.seriesId,
+                            bypassCooldown = retryTick > 0
+                        )
+                        episodeStates[curItem.seriesId] = FeedEpisodeState(
+                            detail = detail,
+                            episodeIndex = epIdx,
+                            media = media,
+                            loading = false,
+                            error = null
+                        )
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (e: Exception) {
+                    episodeStates[curItem.seriesId] = (
+                        episodeStates[curItem.seriesId] ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex)
+                        ).copy(loading = false, error = friendlyErrorMessage(e, "片源准备失败，请点击重试"))
+                }
+            }
+        }
+
+        // Pre-prepare adjacent next page synchronously if cached, or preload resumed episode
+        val nextItem = feedItems.getOrNull(pagerState.currentPage + 1)
+        if (nextItem != null && !episodeStates.containsKey(nextItem.seriesId)) {
+            val nextHist = history.firstOrNull { it.seriesId == nextItem.seriesId }
+            if (nextHist == null && nextItem.initialVid.isNotEmpty()) {
+                val nextPeek = container.mediaCache.peekResolvedSource(nextItem.initialVid, effectiveQuality)
+                if (nextPeek != null) {
+                    val nextDetail = container.apiClient.peekSeriesDetail(nextItem.seriesId)
+                    val nextEpIdx = nextDetail?.episodes?.firstOrNull { it.vid == nextItem.initialVid }?.index
+                        ?: nextItem.initialEpisodeIndex
+                    episodeStates[nextItem.seriesId] = FeedEpisodeState(
+                        detail = nextDetail,
+                        episodeIndex = nextEpIdx,
+                        media = nextPeek,
                         loading = false,
                         error = null
                     )
                 }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                episodeStates[curItem.seriesId] = (
-                    episodeStates[curItem.seriesId] ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex)
-                    ).copy(loading = false, error = friendlyErrorMessage(e, "片源准备失败，请点击重试"))
-            }
-        }
-
-        // Preload next drama in the feed (respecting watch history episode when present)
-        if (settings.preloadNextEpisode) {
-            val nextItem = feedItems.getOrNull(pagerState.currentPage + 1)
-            if (nextItem != null && !episodeStates.containsKey(nextItem.seriesId)) {
+            } else if (nextHist != null && settings.preloadNextEpisode) {
                 scope.launch {
                     runCatching {
-                        val nextHist = history.firstOrNull { it.seriesId == nextItem.seriesId }
-                        val targetVid = if (nextHist == null && nextItem.initialVid.isNotEmpty()) {
-                            nextItem.initialVid
-                        } else {
-                            val d = container.apiClient.fetchSeriesDetail(nextItem.seriesId)
-                            val idx = (nextHist?.lastEpisodeIndex ?: 1).coerceIn(1, d.episodes.size)
-                            d.episodes[idx - 1].vid
-                        }
+                        val d = container.apiClient.fetchSeriesDetail(nextItem.seriesId)
+                        val idx = nextHist.lastEpisodeIndex.coerceIn(1, d.episodes.size)
                         container.mediaCache.preloadInBackground(
-                            vids = listOf(targetVid),
+                            vids = listOf(d.episodes[idx - 1].vid),
                             quality = effectiveQuality,
                             seriesId = nextItem.seriesId,
                             wifiOnly = settings.wifiOnlyPreload

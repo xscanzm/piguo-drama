@@ -17,6 +17,7 @@ import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import io.github.hongguo.mobile.core.ByteHelpers
+import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.HongguoApiClient
 import io.github.hongguo.mobile.core.LocalStore
@@ -39,6 +40,8 @@ import okhttp3.Request
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class ResolvedMediaSource(
     val uri: Uri,
@@ -51,6 +54,58 @@ data class ResolvedMediaSource(
     val fallbackSources: List<ResolvedMediaSource> = emptyList()
 )
 
+internal data class RollingPrecacheTarget(
+    val summary: DramaSummary,
+    val fullLocalDownload: Boolean,
+    val aheadIndex: Int
+)
+
+internal fun computeRollingPrecacheTargetCount(
+    isWifi: Boolean,
+    wifiOnlyPreload: Boolean,
+    preloadEnabled: Boolean
+): Int {
+    if (!preloadEnabled) return 0
+    if (wifiOnlyPreload && !isWifi) return 0
+    return if (isWifi) 15 else 4
+}
+
+internal fun computeFeedLowWaterMark(
+    isWifi: Boolean,
+    wifiOnlyPreload: Boolean,
+    preloadEnabled: Boolean
+): Int {
+    if (!preloadEnabled) return 3
+    if (wifiOnlyPreload && !isWifi) return 3
+    return if (isWifi) 10 else 4
+}
+
+internal fun selectRollingPrecacheTargets(
+    upcomingCandidates: List<DramaSummary>,
+    excludedSeriesIds: Set<String>,
+    failedSeriesIds: Set<String>,
+    targetCount: Int,
+    fullLocalAheadCount: Int = 2
+): List<RollingPrecacheTarget> {
+    if (targetCount <= 0) return emptyList()
+    val seen = HashSet<String>()
+    val result = ArrayList<RollingPrecacheTarget>(targetCount)
+    for (cand in upcomingCandidates) {
+        val sid = cand.seriesId.trim()
+        if (sid.isEmpty() || sid in excludedSeriesIds || sid in failedSeriesIds || !seen.add(sid)) continue
+        val idx = result.size
+        result.add(
+            RollingPrecacheTarget(
+                summary = cand,
+                fullLocalDownload = idx < fullLocalAheadCount,
+                aheadIndex = idx
+            )
+        )
+        if (result.size >= targetCount) break
+    }
+    return result
+}
+
 @OptIn(UnstableApi::class)
 class MediaCacheManager(
     context: Context,
@@ -59,10 +114,16 @@ class MediaCacheManager(
     private val protectedCacheFilenamesProvider: () -> Set<String> = { emptySet() },
     private val networkMonitor: NetworkMonitor? = null
 ) {
-    private data class WarmPrecachePlan(
+    private class RollingPrecachePlan(
+        val generation: Long,
+        val channelKey: String,
         val candidates: List<DramaSummary>,
         val settings: UserSettings,
-        val excludedIds: Set<String>
+        val localStore: LocalStore,
+        val excludedIds: Set<String>,
+        val persistWarmStore: Boolean,
+        val enabled: Boolean,
+        val onImmediateNextReady: ((seriesId: String, media: ResolvedMediaSource, detail: DramaDetail?, episodeIndex: Int) -> Unit)?
     )
 
     private val appContext = context.applicationContext
@@ -81,18 +142,45 @@ class MediaCacheManager(
     private val activePreloads = ConcurrentHashMap.newKeySet<String>()
     private val warmWorkerMutex = Mutex()
     private val warmFailedSeriesIds = ConcurrentHashMap.newKeySet<String>()
+    private val foregroundResolveCount = AtomicInteger(0)
     @Volatile
-    private var latestWarmPlan: WarmPrecachePlan? = null
+    private var foregroundPlaybackReady: Boolean = true
+    @Volatile
+    private var foregroundWaitSinceMs: Long = 0L
+    private val rollingPlanGeneration = AtomicLong(0L)
+    @Volatile
+    private var latestRollingPlan: RollingPrecachePlan? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        private const val MAX_DECRYPTED_BYTES = 300L * 1024L * 1024L
-        private const val MAX_STREAM_CACHE_BYTES = 200L * 1024L * 1024L
+        private const val MAX_DECRYPTED_BYTES = 350L * 1024L * 1024L
+        private const val MAX_STREAM_CACHE_BYTES = 300L * 1024L * 1024L
         private const val MAX_EPISODE_BYTES = 256L * 1024L * 1024L
         private const val RESOLVED_SOURCE_TTL_MS = 300_000L
         private const val MAX_RESOLVED_CACHE_ENTRIES = 120
-        private const val PRELOAD_HEAD_BYTES = 1_536L * 1024L
-        private const val PRELOAD_MIN_CACHED_BYTES = 256L * 1024L
+        private const val PRELOAD_HEAD_BYTES = 2_560L * 1024L
+        private const val PRELOAD_MIN_CACHED_BYTES = 512L * 1024L
+        private const val FULL_LOCAL_AHEAD_COUNT = 2
+    }
+
+    fun setForegroundPlaybackReady(ready: Boolean) {
+        foregroundPlaybackReady = ready
+        if (ready) {
+            foregroundWaitSinceMs = 0L
+        } else if (foregroundWaitSinceMs == 0L) {
+            foregroundWaitSinceMs = System.currentTimeMillis()
+        }
+    }
+
+    private fun shouldYieldBackgroundToForeground(): Boolean {
+        if (foregroundResolveCount.get() > 0) return true
+        if (!foregroundPlaybackReady) {
+            val started = foregroundWaitSinceMs
+            if (started > 0L && (System.currentTimeMillis() - started) < 6_000L) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun cacheFile(vid: String, quality: QualityPreference): File =
@@ -218,7 +306,8 @@ class MediaCacheManager(
         vid: String,
         quality: QualityPreference,
         seriesId: String? = null,
-        bypassCooldown: Boolean = false
+        bypassCooldown: Boolean = false,
+        isBackground: Boolean = false
     ): ResolvedMediaSource {
         val cached = cacheFile(vid, quality)
         if (cached.exists() && cached.length() > 1024L) {
@@ -252,13 +341,17 @@ class MediaCacheManager(
             return prev.await()
         }
 
+        if (!isBackground) {
+            foregroundResolveCount.incrementAndGet()
+        }
         try {
             val result = withContext(Dispatchers.IO) {
                 val playResult = api.fetchEpisodePlayInfo(
                     vid = vid,
                     preferredQuality = quality,
                     seriesId = seriesId,
-                    bypassCooldown = bypassCooldown
+                    bypassCooldown = bypassCooldown,
+                    isBackground = isBackground
                 )
                 val plainVariants = playResult.variants.filter { it.contentKeyHex.isNullOrEmpty() }
                 val plainSources = plainVariants.mapIndexed { idx, v ->
@@ -311,8 +404,39 @@ class MediaCacheManager(
             deferred.completeExceptionally(t)
             throw t
         } finally {
+            if (!isBackground) {
+                foregroundResolveCount.decrementAndGet()
+            }
             inflight.remove(key, deferred)
         }
+    }
+
+    fun isStreamHeadCached(source: ResolvedMediaSource): Boolean {
+        if (source.isLocalFile) return true
+        if (source.cacheKey.isBlank()) return false
+        val cached = runCatching {
+            streamCache.getCachedBytes(source.cacheKey, 0L, PRELOAD_HEAD_BYTES)
+        }.getOrDefault(0L)
+        return cached >= PRELOAD_MIN_CACHED_BYTES
+    }
+
+    private fun cacheStreamHead(source: ResolvedMediaSource): Boolean {
+        if (source.isLocalFile || source.cacheKey.isBlank()) return true
+        if (isStreamHeadCached(source)) return true
+        val dataSource = CacheDataSource.Factory()
+            .setCache(streamCache)
+            .setUpstreamDataSourceFactory(buildOkHttpDataSourceFactory(source))
+            .createDataSourceForDownloading()
+        val dataSpec = DataSpec.Builder()
+            .setUri(source.uri)
+            .setKey(source.cacheKey)
+            .setPosition(0L)
+            .setLength(PRELOAD_HEAD_BYTES)
+            .build()
+        return runCatching {
+            CacheWriter(dataSource, dataSpec, null, null).cache()
+            isStreamHeadCached(source)
+        }.getOrDefault(false)
     }
 
     fun preloadInBackground(
@@ -330,26 +454,9 @@ class MediaCacheManager(
             activePreloads.add(key)
             scope.launch {
                 try {
-                    val resolved = resolvePlayableSource(vid, quality, seriesId = seriesId)
+                    val resolved = resolvePlayableSource(vid, quality, seriesId = seriesId, isBackground = true)
                     if (!resolved.isLocalFile && resolved.cacheKey.isNotEmpty()) {
-                        val alreadyCached = runCatching {
-                            streamCache.getCachedBytes(resolved.cacheKey, 0L, PRELOAD_HEAD_BYTES)
-                        }.getOrDefault(0L)
-                        if (alreadyCached < PRELOAD_MIN_CACHED_BYTES) {
-                            runCatching {
-                                val dataSource = CacheDataSource.Factory()
-                                    .setCache(streamCache)
-                                    .setUpstreamDataSourceFactory(buildOkHttpDataSourceFactory(resolved))
-                                    .createDataSourceForDownloading()
-                                val dataSpec = DataSpec.Builder()
-                                    .setUri(resolved.uri)
-                                    .setKey(resolved.cacheKey)
-                                    .setPosition(0L)
-                                    .setLength(PRELOAD_HEAD_BYTES)
-                                    .build()
-                                CacheWriter(dataSource, dataSpec, null, null).cache()
-                            }
-                        }
+                        cacheStreamHead(resolved)
                     }
                 } catch (_: Throwable) {
                 } finally {
@@ -435,10 +542,11 @@ class MediaCacheManager(
     suspend fun downloadToLocalCache(
         vid: String,
         quality: QualityPreference,
-        seriesId: String? = null
+        seriesId: String? = null,
+        isBackground: Boolean = false
     ): ResolvedMediaSource? {
         peekLocalFileSource(vid, quality.key)?.let { return it }
-        val resolved = resolvePlayableSource(vid, quality, seriesId = seriesId)
+        val resolved = resolvePlayableSource(vid, quality, seriesId = seriesId, isBackground = isBackground)
         if (resolved.isLocalFile) return resolved
 
         val target = cacheFile(vid, quality)
@@ -472,6 +580,9 @@ class MediaCacheManager(
                                 tmp.outputStream().use { output ->
                                     val buf = ByteArray(16 * 1024)
                                     while (true) {
+                                        if (isBackground && foregroundResolveCount.get() > 0) {
+                                            Thread.sleep(60L)
+                                        }
                                         val n = input.read(buf)
                                         if (n <= 0) break
                                         total += n
@@ -504,103 +615,216 @@ class MediaCacheManager(
         }
     }
 
-    fun scheduleWarmFeedPrecache(
+    fun pauseRollingFeedPrecache() {
+        val gen = rollingPlanGeneration.incrementAndGet()
+        latestRollingPlan = latestRollingPlan?.let { prev ->
+            RollingPrecachePlan(
+                generation = gen,
+                channelKey = prev.channelKey,
+                candidates = prev.candidates,
+                settings = prev.settings,
+                localStore = prev.localStore,
+                excludedIds = prev.excludedIds,
+                persistWarmStore = prev.persistWarmStore,
+                enabled = false,
+                onImmediateNextReady = null
+            )
+        }
+    }
+
+    fun scheduleRollingFeedPrecache(
+        channelKey: String,
         candidates: List<DramaSummary>,
         settings: UserSettings,
         localStore: LocalStore,
-        excludedIds: Set<String>
+        excludedIds: Set<String>,
+        persistWarmStore: Boolean,
+        enabled: Boolean = true,
+        onImmediateNextReady: ((seriesId: String, media: ResolvedMediaSource, detail: DramaDetail?, episodeIndex: Int) -> Unit)? = null
     ) {
-        latestWarmPlan = WarmPrecachePlan(
+        val gen = rollingPlanGeneration.incrementAndGet()
+        latestRollingPlan = RollingPrecachePlan(
+            generation = gen,
+            channelKey = channelKey,
             candidates = candidates,
             settings = settings,
-            excludedIds = excludedIds
+            localStore = localStore,
+            excludedIds = excludedIds,
+            persistWarmStore = persistWarmStore,
+            enabled = enabled,
+            onImmediateNextReady = onImmediateNextReady
         )
-        if (!settings.preloadNextEpisode || (settings.wifiOnlyPreload && !isOnWifi())) return
+        if (!enabled || !settings.preloadNextEpisode || (settings.wifiOnlyPreload && !isOnWifi())) return
 
         scope.launch {
             if (!warmWorkerMutex.tryLock()) return@launch
             try {
-                val extraFetched = ArrayList<DramaSummary>()
-                var extraFetchAttempts = 0
-                for (step in 0 until 16) {
-                    val plan = latestWarmPlan ?: break
-                    if (!plan.settings.preloadNextEpisode || (plan.settings.wifiOnlyPreload && !isOnWifi())) {
+                var prunedGeneration = -1L
+                val notifiedImmediateNextKeys = HashSet<String>()
+                for (step in 0 until 200) {
+                    val plan = latestRollingPlan ?: break
+                    if (!plan.enabled || !plan.settings.preloadNextEpisode || (plan.settings.wifiOnlyPreload && !isOnWifi())) {
                         break
                     }
-                    val targetCount = if (isOnWifi()) 10 else 3
+
+                    var pausedOut = false
+                    while (shouldYieldBackgroundToForeground()) {
+                        delay(220L)
+                        val refreshed = latestRollingPlan
+                        if (refreshed == null || !refreshed.enabled || !refreshed.settings.preloadNextEpisode ||
+                            (refreshed.settings.wifiOnlyPreload && !isOnWifi())
+                        ) {
+                            pausedOut = true
+                            break
+                        }
+                    }
+                    if (pausedOut) break
+
+                    val activePlan = latestRollingPlan ?: break
+                    if (!activePlan.enabled) break
+
+                    val targetCount = computeRollingPrecacheTargetCount(
+                        isWifi = isOnWifi(),
+                        wifiOnlyPreload = activePlan.settings.wifiOnlyPreload,
+                        preloadEnabled = activePlan.settings.preloadNextEpisode
+                    )
+                    if (targetCount <= 0) break
+
+                    val quality = effectiveQuality(activePlan.settings)
                     val combinedExcluded = buildSet {
-                        addAll(plan.excludedIds)
-                        addAll(localStore.seenSeriesIdsSnapshot())
-                        addAll(localStore.feedPreferences.value.dislikedSeriesIds)
-                        for (h in localStore.history.value) add(h.seriesId)
-                        for (f in localStore.favorites.value) add(f.seriesId)
+                        addAll(activePlan.excludedIds)
+                        addAll(activePlan.localStore.seenSeriesIdsSnapshot())
+                        addAll(activePlan.localStore.feedPreferences.value.dislikedSeriesIds)
+                        for (h in activePlan.localStore.history.value) add(h.seriesId)
+                        for (f in activePlan.localStore.favorites.value) add(f.seriesId)
                     }
-                    val validWarm = localStore.pruneWarmFeedEntries(combinedExcluded) { entry ->
-                        hasLocalFile(entry.vid, entry.qualityKey)
-                    }
-                    if (validWarm.size >= targetCount) break
-
-                    val warmIds = validWarm.mapTo(HashSet()) { it.summary.seriesId }
-                    val pool = plan.candidates + extraFetched
-                    var nextCandidate = pool.firstOrNull { cand ->
-                        cand.seriesId !in combinedExcluded &&
-                            cand.seriesId !in warmIds &&
-                            cand.seriesId !in warmFailedSeriesIds
-                    }
-                    if (nextCandidate == null && extraFetchAttempts < 2) {
-                        val pageToFetch = 2 + extraFetchAttempts
-                        extraFetchAttempts++
-                        val fetched = runCatching {
-                            api.fetchRecommendFeed("hot-drama", page = pageToFetch, forceRefresh = false)
-                        }.getOrNull()?.items.orEmpty()
-                        val existing = pool.mapTo(HashSet()) { it.seriesId }
-                        for (item in fetched) {
-                            if (existing.add(item.seriesId)) extraFetched.add(item)
-                        }
-                        nextCandidate = extraFetched.firstOrNull { cand ->
-                            cand.seriesId !in combinedExcluded &&
-                                cand.seriesId !in warmIds &&
-                                cand.seriesId !in warmFailedSeriesIds
+                    if (activePlan.persistWarmStore && prunedGeneration != activePlan.generation) {
+                        prunedGeneration = activePlan.generation
+                        activePlan.localStore.pruneWarmFeedEntries(combinedExcluded) { entry ->
+                            hasLocalFile(entry.vid, entry.qualityKey)
                         }
                     }
-                    val candidate = nextCandidate ?: break
 
-                    val quality = effectiveQuality(plan.settings)
-                    var detail = api.peekSeriesDetail(candidate.seriesId)
-                    val vid = candidate.initialVid.ifBlank {
+                    val targets = selectRollingPrecacheTargets(
+                        upcomingCandidates = activePlan.candidates,
+                        excludedSeriesIds = combinedExcluded,
+                        failedSeriesIds = warmFailedSeriesIds,
+                        targetCount = targetCount,
+                        fullLocalAheadCount = FULL_LOCAL_AHEAD_COUNT
+                    )
+                    if (targets.isEmpty()) break
+
+                    var nextWork: RollingPrecacheTarget? = null
+                    for (t in targets) {
+                        val sid = t.summary.seriesId
+                        val cachedDetail = api.peekSeriesDetail(sid)
+                        val knownVid = t.summary.initialVid.ifBlank {
+                            cachedDetail?.episodes?.getOrNull((t.summary.initialEpisodeIndex - 1).coerceAtLeast(0))?.vid
+                                ?: cachedDetail?.episodes?.firstOrNull()?.vid
+                                ?: ""
+                        }
+                        if (knownVid.isNotBlank() && hasLocalFile(knownVid, quality.key)) {
+                            if (t.aheadIndex == 0) {
+                                val notifyKey = "${activePlan.generation}:${sid}:${quality.key}"
+                                if (notifiedImmediateNextKeys.add(notifyKey)) {
+                                    peekLocalFileSource(knownVid, quality.key)?.let { localSrc ->
+                                        val epIdx = cachedDetail?.episodes?.firstOrNull { it.vid == knownVid }?.index
+                                            ?: t.summary.initialEpisodeIndex
+                                        activePlan.onImmediateNextReady?.invoke(sid, localSrc, cachedDetail, epIdx)
+                                    }
+                                }
+                            }
+                            if (activePlan.persistWarmStore &&
+                                sid !in activePlan.localStore.seenSeriesIdsSnapshot() &&
+                                sid !in activePlan.localStore.feedPreferences.value.dislikedSeriesIds
+                            ) {
+                                val epIdx = cachedDetail?.episodes?.firstOrNull { it.vid == knownVid }?.index
+                                    ?: t.summary.initialEpisodeIndex
+                                activePlan.localStore.upsertWarmFeedEntry(
+                                    WarmFeedEntry(
+                                        summary = t.summary,
+                                        detail = cachedDetail,
+                                        vid = knownVid,
+                                        episodeIndex = epIdx,
+                                        qualityKey = quality.key
+                                    )
+                                )
+                            }
+                            continue
+                        }
+                        if (!t.fullLocalDownload && knownVid.isNotBlank()) {
+                            val mem = peekResolvedSource(knownVid, quality)
+                            if (mem != null && isStreamHeadCached(mem)) {
+                                continue
+                            }
+                        }
+                        nextWork = t
+                        break
+                    }
+
+                    val work = nextWork ?: break
+                    val cand = work.summary
+                    var detail = api.peekSeriesDetail(cand.seriesId)
+                    val vid = cand.initialVid.ifBlank {
                         if (detail == null) {
-                            detail = runCatching { api.fetchSeriesDetail(candidate.seriesId) }.getOrNull()
+                            detail = runCatching { api.fetchSeriesDetail(cand.seriesId) }.getOrNull()
                         }
-                        detail?.episodes?.getOrNull((candidate.initialEpisodeIndex - 1).coerceAtLeast(0))?.vid
+                        detail?.episodes?.getOrNull((cand.initialEpisodeIndex - 1).coerceAtLeast(0))?.vid
                             ?: detail?.episodes?.firstOrNull()?.vid
                             ?: ""
                     }
                     if (vid.isBlank()) {
-                        warmFailedSeriesIds.add(candidate.seriesId)
+                        warmFailedSeriesIds.add(cand.seriesId)
                         continue
                     }
 
-                    val cachedMedia = runCatching {
-                        downloadToLocalCache(vid = vid, quality = quality, seriesId = candidate.seriesId)
+                    val resolved = runCatching {
+                        resolvePlayableSource(vid, quality, seriesId = cand.seriesId, isBackground = true)
                     }.getOrNull()
-                    if (cachedMedia == null) {
-                        warmFailedSeriesIds.add(candidate.seriesId)
-                        delay(500L)
+                    if (resolved == null) {
+                        warmFailedSeriesIds.add(cand.seriesId)
+                        delay(350L)
                         continue
                     }
 
-                    if (detail == null) {
-                        detail = runCatching { api.fetchSeriesDetail(candidate.seriesId) }.getOrNull()
+                    var readyMedia: ResolvedMediaSource = resolved
+                    if (!resolved.isLocalFile) {
+                        if (work.fullLocalDownload) {
+                            val local = runCatching {
+                                downloadToLocalCache(vid = vid, quality = quality, seriesId = cand.seriesId, isBackground = true)
+                            }.getOrNull()
+                            if (local != null) {
+                                readyMedia = local
+                            } else {
+                                cacheStreamHead(resolved)
+                            }
+                        } else {
+                            cacheStreamHead(resolved)
+                        }
                     }
-                    val epIdx = detail?.episodes?.firstOrNull { it.vid == vid }?.index
-                        ?: candidate.initialEpisodeIndex
 
-                    if (candidate.seriesId !in localStore.seenSeriesIdsSnapshot() &&
-                        candidate.seriesId !in localStore.feedPreferences.value.dislikedSeriesIds
+                    if (work.aheadIndex == 0) {
+                        val notifyKey = "${activePlan.generation}:${cand.seriesId}:${quality.key}"
+                        if (notifiedImmediateNextKeys.add(notifyKey)) {
+                            val epIdx = detail?.episodes?.firstOrNull { it.vid == vid }?.index
+                                ?: cand.initialEpisodeIndex
+                            activePlan.onImmediateNextReady?.invoke(cand.seriesId, readyMedia, detail, epIdx)
+                        }
+                    }
+
+                    if (activePlan.persistWarmStore &&
+                        readyMedia.isLocalFile &&
+                        cand.seriesId !in activePlan.localStore.seenSeriesIdsSnapshot() &&
+                        cand.seriesId !in activePlan.localStore.feedPreferences.value.dislikedSeriesIds
                     ) {
-                        localStore.upsertWarmFeedEntry(
+                        if (detail == null) {
+                            detail = runCatching { api.fetchSeriesDetail(cand.seriesId) }.getOrNull()
+                        }
+                        val epIdx = detail?.episodes?.firstOrNull { it.vid == vid }?.index
+                            ?: cand.initialEpisodeIndex
+                        activePlan.localStore.upsertWarmFeedEntry(
                             WarmFeedEntry(
-                                summary = candidate,
+                                summary = cand,
                                 detail = detail,
                                 vid = vid,
                                 episodeIndex = epIdx,
@@ -608,7 +832,7 @@ class MediaCacheManager(
                             )
                         )
                     }
-                    delay(800L)
+                    delay(180L)
                 }
             } finally {
                 warmWorkerMutex.unlock()

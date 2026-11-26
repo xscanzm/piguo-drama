@@ -3,6 +3,9 @@ package io.github.hongguo.mobile.core
 
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
+import io.github.hongguo.mobile.player.computeFeedLowWaterMark
+import io.github.hongguo.mobile.player.computeRollingPrecacheTargetCount
+import io.github.hongguo.mobile.player.selectRollingPrecacheTargets
 import io.github.hongguo.mobile.ui.components.shouldShowFullscreenControls
 import io.github.hongguo.mobile.ui.screens.shouldHoldFullSeriesControlsVisible
 import org.junit.Assert.assertArrayEquals
@@ -425,5 +428,95 @@ class StabilityAndUxTest {
                 hasLoadError = true
             )
         )
+    }
+
+    @Test
+    fun rollingFeedPrecachePolicyCoversTargetsTiersAndReplenishment() {
+        assertEquals(15, computeRollingPrecacheTargetCount(isWifi = true, wifiOnlyPreload = true, preloadEnabled = true))
+        assertEquals(4, computeRollingPrecacheTargetCount(isWifi = false, wifiOnlyPreload = false, preloadEnabled = true))
+        assertEquals(0, computeRollingPrecacheTargetCount(isWifi = false, wifiOnlyPreload = true, preloadEnabled = true))
+        assertEquals(0, computeRollingPrecacheTargetCount(isWifi = true, wifiOnlyPreload = false, preloadEnabled = false))
+
+        assertEquals(10, computeFeedLowWaterMark(isWifi = true, wifiOnlyPreload = true, preloadEnabled = true))
+        assertEquals(4, computeFeedLowWaterMark(isWifi = false, wifiOnlyPreload = false, preloadEnabled = true))
+        assertEquals(3, computeFeedLowWaterMark(isWifi = false, wifiOnlyPreload = true, preloadEnabled = true))
+
+        val candidates = (1..22).map { i ->
+            DramaSummary(seriesId = "s$i", title = "剧$i", initialVid = "v$i")
+        } + listOf(DramaSummary(seriesId = "s5", title = "重复s5", initialVid = "v5"))
+
+        val initialWindow = selectRollingPrecacheTargets(
+            upcomingCandidates = candidates,
+            excludedSeriesIds = setOf("s2"),
+            failedSeriesIds = setOf("s4"),
+            targetCount = 15,
+            fullLocalAheadCount = 2
+        )
+        assertEquals(15, initialWindow.size)
+        // s1 and s3 become aheadIndex 0 & 1 -> full local download
+        assertEquals(listOf("s1", "s3"), initialWindow.filter { it.fullLocalDownload }.map { it.summary.seriesId })
+        assertEquals(listOf("s5", "s6", "s7"), initialWindow.drop(2).take(3).map { it.summary.seriesId })
+        assertTrue(initialWindow.drop(2).none { it.fullLocalDownload })
+        assertEquals("s17", initialWindow.last().summary.seriesId)
+
+        // Simulate watching s1 and s3: window slides forward, promoting s5 & s6 to full download and adding s18 & s19
+        val rolledWindow = selectRollingPrecacheTargets(
+            upcomingCandidates = candidates.drop(3),
+            excludedSeriesIds = setOf("s2", "s4"),
+            failedSeriesIds = emptySet(),
+            targetCount = 15,
+            fullLocalAheadCount = 2
+        )
+        assertEquals(15, rolledWindow.size)
+        assertEquals(listOf("s5", "s6"), rolledWindow.filter { it.fullLocalDownload }.map { it.summary.seriesId })
+        assertEquals("s19", rolledWindow.last().summary.seriesId)
+    }
+
+    @Test
+    fun rankPlayVariantsPrefersPlainStreamsAndMatchesRequestedQuality() {
+        val enc720 = PlayVariant(url = "https://v.example/e720", contentKeyHex = "abcd", codec = "h264", quality = "720p", width = 720, height = 1280, userAgent = "ua")
+        val plain720 = PlayVariant(url = "https://v.example/p720", contentKeyHex = null, codec = "h264", quality = "720p", width = 720, height = 1280, userAgent = "ua")
+        val plain480 = PlayVariant(url = "https://v.example/p480", contentKeyHex = null, codec = "h264", quality = "480p", width = 480, height = 854, userAgent = "ua")
+        val enc480 = PlayVariant(url = "https://v.example/e480", contentKeyHex = "ef01", codec = "h264", quality = "480p", width = 480, height = 854, userAgent = "ua")
+        val plain360 = PlayVariant(url = "https://v.example/p360", contentKeyHex = null, codec = "h264", quality = "360p", width = 360, height = 640, userAgent = "ua")
+
+        // AUTO prefers plain watchable (>= 480p) ahead of encrypted, and keeps high-res encrypted above 360p plain
+        val autoRanked = rankPlayVariants(listOf(plain360, enc720, plain720, enc480), QualityPreference.AUTO)
+        assertEquals(listOf(plain720, enc720, enc480, plain360), autoRanked)
+
+        // 480p prefers 480p plain ahead of 480p encrypted
+        val p480Ranked = rankPlayVariants(listOf(enc720, enc480, plain480), QualityPreference.P480)
+        assertEquals(plain480, p480Ranked.first())
+    }
+
+    @Test
+    fun canReusePrefetchedVariantsWorksForNonAutoQualities() {
+        val single360 = listOf(PlayVariant(url = "https://v/360", contentKeyHex = null, codec = "h264", quality = "360p", width = 360, height = 640, userAgent = "ua"))
+        val multi = listOf(
+            PlayVariant(url = "https://v/720", contentKeyHex = null, codec = "h264", quality = "720p", width = 720, height = 1280, userAgent = "ua"),
+            PlayVariant(url = "https://v/480", contentKeyHex = null, codec = "h264", quality = "480p", width = 480, height = 854, userAgent = "ua")
+        )
+        assertTrue(canReusePrefetchedVariants(single360, QualityPreference.AUTO))
+        assertFalse(canReusePrefetchedVariants(single360, QualityPreference.P1080))
+        assertTrue(canReusePrefetchedVariants(multi, QualityPreference.P480))
+        assertTrue(canReusePrefetchedVariants(multi, QualityPreference.P1080))
+    }
+
+    @Test
+    fun playbackHostSelectorPromotesFastHealthyHostAndDemotesFailedHost() {
+        val selector = PlaybackHostSelector()
+        val base = listOf("hostA", "hostB", "hostC", "hostD")
+        assertEquals(listOf("hostA", "hostB", "hostC"), selector.orderedHosts(base, 3, nowMs = 1_000L))
+
+        selector.recordFailure("hostA", nowMs = 1_000L)
+        selector.recordSuccess("hostC", latencyMs = 80L, nowMs = 1_100L)
+        selector.recordSuccess("hostB", latencyMs = 260L, nowMs = 1_200L)
+
+        // hostC (80ms) first, hostB (260ms) second, hostD (untested) third, hostA (cooldown) last/excluded
+        assertEquals(listOf("hostC", "hostB", "hostD"), selector.orderedHosts(base, 3, nowMs = 5_000L))
+        assertEquals("hostA", selector.orderedHosts(base, 4, nowMs = 5_000L).last())
+
+        // After cooldown expires (> 30s), hostA recovers behind tested healthy hosts or in base order among untested
+        assertEquals(listOf("hostC", "hostB", "hostA"), selector.orderedHosts(base, 3, nowMs = 35_000L))
     }
 }
