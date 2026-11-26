@@ -21,6 +21,7 @@ import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.HongguoApiClient
 import io.github.hongguo.mobile.core.LocalStore
 import io.github.hongguo.mobile.core.Mp4CencDecryptor
+import io.github.hongguo.mobile.core.NetworkMonitor
 import io.github.hongguo.mobile.core.PlayVariant
 import io.github.hongguo.mobile.core.QualityPreference
 import io.github.hongguo.mobile.core.UserSettings
@@ -55,7 +56,8 @@ class MediaCacheManager(
     context: Context,
     private val api: HongguoApiClient,
     private val httpClient: OkHttpClient,
-    private val protectedCacheFilenamesProvider: () -> Set<String> = { emptySet() }
+    private val protectedCacheFilenamesProvider: () -> Set<String> = { emptySet() },
+    private val networkMonitor: NetworkMonitor? = null
 ) {
     private data class WarmPrecachePlan(
         val candidates: List<DramaSummary>,
@@ -88,6 +90,7 @@ class MediaCacheManager(
         private const val MAX_STREAM_CACHE_BYTES = 200L * 1024L * 1024L
         private const val MAX_EPISODE_BYTES = 256L * 1024L * 1024L
         private const val RESOLVED_SOURCE_TTL_MS = 300_000L
+        private const val MAX_RESOLVED_CACHE_ENTRIES = 120
         private const val PRELOAD_HEAD_BYTES = 1_536L * 1024L
         private const val PRELOAD_MIN_CACHED_BYTES = 256L * 1024L
     }
@@ -138,6 +141,7 @@ class MediaCacheManager(
     }
 
     fun isOnWifi(): Boolean {
+        networkMonitor?.status?.value?.let { return it.isWifi }
         return runCatching {
             val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                 ?: return true
@@ -148,15 +152,47 @@ class MediaCacheManager(
         }.getOrDefault(true)
     }
 
-    fun effectiveQuality(settings: UserSettings): QualityPreference {
+    fun effectiveQuality(settings: UserSettings, isWifi: Boolean = isOnWifi()): QualityPreference {
         val chosen = QualityPreference.entries.firstOrNull { it.key == settings.quality } ?: QualityPreference.AUTO
-        if (settings.cellularAutoLowQuality && !isOnWifi()) {
+        if (settings.cellularAutoLowQuality && !isWifi) {
             return when (chosen) {
                 QualityPreference.P480, QualityPreference.P360 -> chosen
                 else -> QualityPreference.P480
             }
         }
         return chosen
+    }
+
+    fun invalidateSource(vid: String, quality: QualityPreference) {
+        if (vid.isBlank()) return
+        val key = "${vid}_${quality.key}"
+        resolvedSourceCache.remove(key)
+        runCatching {
+            val f = cacheFile(vid, quality)
+            if (f.exists()) f.delete()
+        }
+        runCatching {
+            streamCache.removeResource(key)
+            for (idx in 1..4) {
+                streamCache.removeResource("${key}_s$idx")
+            }
+        }
+    }
+
+    private fun pruneResolvedCacheIfNeeded() {
+        if (resolvedSourceCache.size <= MAX_RESOLVED_CACHE_ENTRIES) return
+        val now = System.currentTimeMillis()
+        val it = resolvedSourceCache.entries.iterator()
+        while (it.hasNext()) {
+            if (it.next().value.first <= now) it.remove()
+        }
+        if (resolvedSourceCache.size > MAX_RESOLVED_CACHE_ENTRIES) {
+            val surplus = resolvedSourceCache.size - MAX_RESOLVED_CACHE_ENTRIES
+            resolvedSourceCache.entries
+                .sortedBy { it.value.first }
+                .take(surplus)
+                .forEach { resolvedSourceCache.remove(it.key) }
+        }
     }
 
     private fun buildOkHttpDataSourceFactory(source: ResolvedMediaSource): OkHttpDataSource.Factory =
@@ -267,6 +303,7 @@ class MediaCacheManager(
             }
             if (!result.isLocalFile) {
                 resolvedSourceCache[key] = (System.currentTimeMillis() + RESOLVED_SOURCE_TTL_MS) to result
+                pruneResolvedCacheIfNeeded()
             }
             deferred.complete(result)
             return result

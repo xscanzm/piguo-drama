@@ -16,15 +16,21 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 
 class LocalStore(context: Context) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val fileWriteLock = Any()
+    private val pendingFileWrites = ConcurrentHashMap<String, Job>()
     @Volatile
     private var historyWriteJob: Job? = null
     @Volatile
     private var seenWriteJob: Job? = null
+    @Volatile
+    private var warmWriteJob: Job? = null
+    @Volatile
+    private var resumeWriteJob: Job? = null
 
     private val dir = File(context.filesDir, "hongguo_store").apply { mkdirs() }
     private val historyFile = File(dir, "watch_history.json")
@@ -33,8 +39,9 @@ class LocalStore(context: Context) {
     private val authFile = File(dir, "auth_session.json")
     private val feedPrefsFile = File(dir, "feed_preferences.json")
     private val searchHistoryFile = File(dir, "search_history.json")
+    private val resumeFile = File(dir, "resume_playback.json")
     private val seenFeedStore = SeenFeedStore(File(dir, "seen_feed.json"))
-    private val warmFeedStore = FeedWarmCacheStore(File(dir, "warm_feed_cache.json"))
+    private val warmFeedStore = FeedWarmCacheStore(File(dir, "warm_feed_cache.json"), persistOnWrite = false)
 
     private val _seenFeedCount = MutableStateFlow(seenFeedStore.size())
     val seenFeedCount: StateFlow<Int> = _seenFeedCount.asStateFlow()
@@ -59,6 +66,9 @@ class LocalStore(context: Context) {
 
     private val _searchHistory = MutableStateFlow(loadList<String>(searchHistoryFile))
     val searchHistory: StateFlow<List<String>> = _searchHistory.asStateFlow()
+
+    private val _resumePlayback = MutableStateFlow(loadResumePlayback())
+    val resumePlayback: StateFlow<ResumePlaybackState?> = _resumePlayback.asStateFlow()
 
     private inline fun <reified T> loadList(file: File): List<T> {
         if (!file.exists()) return emptyList()
@@ -93,6 +103,13 @@ class LocalStore(context: Context) {
         }.getOrDefault(FeedPreferences())
     }
 
+    private fun loadResumePlayback(): ResumePlaybackState? {
+        if (!resumeFile.exists()) return null
+        return runCatching {
+            json.decodeFromString<ResumePlaybackState>(resumeFile.readText(StandardCharsets.UTF_8))
+        }.getOrNull()
+    }
+
     private fun writeAtomicLocked(file: File, content: String) {
         synchronized(fileWriteLock) {
             val atomic = AtomicFile(file)
@@ -107,10 +124,26 @@ class LocalStore(context: Context) {
         }
     }
 
-    private fun persistAsync(file: File, content: String) {
-        ioScope.launch {
-            runCatching { writeAtomicLocked(file, content) }
+    private fun persistLatestAsync(file: File, snapshotProvider: () -> String) {
+        val key = file.name
+        pendingFileWrites[key]?.cancel()
+        val job = ioScope.launch {
+            runCatching {
+                synchronized(fileWriteLock) {
+                    val content = snapshotProvider()
+                    val atomic = AtomicFile(file)
+                    val fos = atomic.startWrite()
+                    try {
+                        fos.write(content.toByteArray(StandardCharsets.UTF_8))
+                        atomic.finishWrite(fos)
+                    } catch (e: Throwable) {
+                        atomic.failWrite(fos)
+                        throw e
+                    }
+                }
+            }
         }
+        pendingFileWrites[key] = job
     }
 
     @Synchronized
@@ -138,15 +171,14 @@ class LocalStore(context: Context) {
         historyWriteJob?.cancel()
         historyWriteJob = ioScope.launch {
             delay(5000L)
-            runCatching { writeAtomicLocked(historyFile, json.encodeToString(_history.value)) }
+            persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
         }
     }
 
     fun flushWatchHistory() {
         historyWriteJob?.cancel()
         historyWriteJob = null
-        val snapshot = _history.value
-        persistAsync(historyFile, json.encodeToString(snapshot))
+        persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
     }
 
     fun getLastWatchEntry(seriesId: String): WatchHistoryEntry? =
@@ -157,7 +189,27 @@ class LocalStore(context: Context) {
         val next = _history.value.filter { it.seriesId != seriesId }
         _history.value = next
         historyWriteJob?.cancel()
-        persistAsync(historyFile, json.encodeToString(next))
+        persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
+    }
+
+    @Synchronized
+    fun clearHistory() {
+        if (_history.value.isEmpty()) return
+        _history.value = emptyList()
+        historyWriteJob?.cancel()
+        persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
+    }
+
+    @Synchronized
+    fun restoreHistoryEntry(entry: WatchHistoryEntry) {
+        val existing = _history.value.firstOrNull { it.seriesId == entry.seriesId }
+        if (existing != null && existing.updatedAt >= entry.updatedAt) return
+        val next = (listOf(entry) + _history.value.filter { it.seriesId != entry.seriesId })
+            .sortedByDescending { it.updatedAt }
+            .take(150)
+        _history.value = next
+        historyWriteJob?.cancel()
+        persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
     }
 
     @Synchronized
@@ -177,7 +229,7 @@ class LocalStore(context: Context) {
             ) + _favorites.value
         }
         _favorites.value = next
-        persistAsync(favoritesFile, json.encodeToString(next))
+        persistLatestAsync(favoritesFile) { json.encodeToString(_favorites.value) }
         return !exists
     }
 
@@ -188,7 +240,7 @@ class LocalStore(context: Context) {
     fun updateSettings(transform: (UserSettings) -> UserSettings) {
         val next = transform(_settings.value)
         _settings.value = next
-        persistAsync(settingsFile, json.encodeToString(next))
+        persistLatestAsync(settingsFile) { json.encodeToString(_settings.value) }
     }
 
     @Synchronized
@@ -217,7 +269,7 @@ class LocalStore(context: Context) {
         }
         val next = cur.copy(dislikedSeriesIds = nextIds, dislikedRecFilters = nextFilters)
         _feedPreferences.value = next
-        persistAsync(feedPrefsFile, json.encodeToString(next))
+        persistLatestAsync(feedPrefsFile) { json.encodeToString(_feedPreferences.value) }
         removeWarmFeedEntry(seriesId)
     }
 
@@ -234,7 +286,7 @@ class LocalStore(context: Context) {
         if (nextIds.size == cur.dislikedSeriesIds.size && nextFilters.size == cur.dislikedRecFilters.size) return
         val next = cur.copy(dislikedSeriesIds = nextIds, dislikedRecFilters = nextFilters)
         _feedPreferences.value = next
-        persistAsync(feedPrefsFile, json.encodeToString(next))
+        persistLatestAsync(feedPrefsFile) { json.encodeToString(_feedPreferences.value) }
     }
 
     fun markFeedSeen(seriesId: String, recFilterInfo: String = "") {
@@ -248,20 +300,90 @@ class LocalStore(context: Context) {
         removeWarmFeedEntry(seriesId)
     }
 
+    private fun scheduleWarmFeedFlush() {
+        warmWriteJob?.cancel()
+        warmWriteJob = ioScope.launch {
+            delay(500L)
+            warmFeedStore.flush()
+        }
+    }
+
+    fun flushWarmFeed() {
+        warmWriteJob?.cancel()
+        warmWriteJob = null
+        ioScope.launch {
+            warmFeedStore.flush()
+        }
+    }
+
     fun warmFeedEntriesSnapshot(): List<WarmFeedEntry> = warmFeedStore.entriesSnapshot()
 
     fun warmFeedSeriesIds(): Set<String> = warmFeedStore.seriesIdsSnapshot()
 
-    fun warmProtectedCacheFilenames(): Set<String> = warmFeedStore.protectedFilenames()
+    fun warmProtectedCacheFilenames(): Set<String> {
+        val base = warmFeedStore.protectedFilenames()
+        val resume = _resumePlayback.value ?: return base
+        if (resume.vid.isBlank()) return base
+        return base + "${resume.vid}_${resume.qualityKey}.mp4"
+    }
+
+    @Synchronized
+    fun saveResumePlayback(state: ResumePlaybackState) {
+        if (state.seriesId.isBlank() ||
+            state.episodeIndex < 2 ||
+            isSeriesCompleted(state.episodeIndex, state.totalEpisodes, state.positionMs, state.durationMs)
+        ) {
+            clearResumePlayback()
+            return
+        }
+        _resumePlayback.value = state
+        resumeWriteJob?.cancel()
+        resumeWriteJob = ioScope.launch {
+            delay(2_000L)
+            persistLatestAsync(resumeFile) {
+                val cur = _resumePlayback.value
+                if (cur != null) json.encodeToString(cur) else ""
+            }
+        }
+    }
+
+    @Synchronized
+    fun clearResumePlayback() {
+        resumeWriteJob?.cancel()
+        resumeWriteJob = null
+        _resumePlayback.value = null
+        pendingFileWrites.remove(resumeFile.name)?.cancel()
+        ioScope.launch {
+            synchronized(fileWriteLock) {
+                if (resumeFile.exists()) resumeFile.delete()
+            }
+        }
+    }
+
+    fun flushResumePlayback() {
+        resumeWriteJob?.cancel()
+        resumeWriteJob = null
+        val snapshot = _resumePlayback.value
+        if (snapshot != null) {
+            persistLatestAsync(resumeFile) {
+                val cur = _resumePlayback.value
+                if (cur != null) json.encodeToString(cur) else ""
+            }
+        } else {
+            clearResumePlayback()
+        }
+    }
 
     fun upsertWarmFeedEntry(entry: WarmFeedEntry) {
         val n = warmFeedStore.upsert(entry)
         _warmFeedCount.value = n
+        scheduleWarmFeedFlush()
     }
 
     fun removeWarmFeedEntry(seriesId: String) {
         val n = warmFeedStore.remove(seriesId)
         _warmFeedCount.value = n
+        scheduleWarmFeedFlush()
     }
 
     fun pruneWarmFeedEntries(
@@ -270,12 +392,14 @@ class LocalStore(context: Context) {
     ): List<WarmFeedEntry> {
         val remaining = warmFeedStore.prune(excludedIds, isValid)
         _warmFeedCount.value = remaining.size
+        scheduleWarmFeedFlush()
         return remaining
     }
 
     fun clearWarmFeedCache() {
         warmFeedStore.clear()
         _warmFeedCount.value = 0
+        scheduleWarmFeedFlush()
     }
 
     fun flushSeenFeed() {
@@ -308,7 +432,7 @@ class LocalStore(context: Context) {
         val nextTags = (listOf(clean) + cur.dislikedTags.filter { it != clean }).take(50)
         val next = cur.copy(dislikedTags = nextTags)
         _feedPreferences.value = next
-        persistAsync(feedPrefsFile, json.encodeToString(next))
+        persistLatestAsync(feedPrefsFile) { json.encodeToString(_feedPreferences.value) }
     }
 
     @Synchronized
@@ -318,14 +442,14 @@ class LocalStore(context: Context) {
         if (nextTags.size == cur.dislikedTags.size) return
         val next = cur.copy(dislikedTags = nextTags)
         _feedPreferences.value = next
-        persistAsync(feedPrefsFile, json.encodeToString(next))
+        persistLatestAsync(feedPrefsFile) { json.encodeToString(_feedPreferences.value) }
     }
 
     @Synchronized
     fun clearDislikes() {
         val next = FeedPreferences()
         _feedPreferences.value = next
-        persistAsync(feedPrefsFile, json.encodeToString(next))
+        persistLatestAsync(feedPrefsFile) { json.encodeToString(_feedPreferences.value) }
     }
 
     @Synchronized
@@ -334,20 +458,20 @@ class LocalStore(context: Context) {
         if (clean.isEmpty()) return
         val next = (listOf(clean) + _searchHistory.value.filter { it != clean }).take(15)
         _searchHistory.value = next
-        persistAsync(searchHistoryFile, json.encodeToString(next))
+        persistLatestAsync(searchHistoryFile) { json.encodeToString(_searchHistory.value) }
     }
 
     @Synchronized
     fun removeSearchHistory(keyword: String) {
         val next = _searchHistory.value.filter { it != keyword }
         _searchHistory.value = next
-        persistAsync(searchHistoryFile, json.encodeToString(next))
+        persistLatestAsync(searchHistoryFile) { json.encodeToString(_searchHistory.value) }
     }
 
     @Synchronized
     fun clearSearchHistory() {
         _searchHistory.value = emptyList()
-        persistAsync(searchHistoryFile, json.encodeToString(emptyList<String>()))
+        persistLatestAsync(searchHistoryFile) { json.encodeToString(_searchHistory.value) }
     }
 
     @Synchronized
@@ -364,7 +488,7 @@ class LocalStore(context: Context) {
         val sorted = merged.values.sortedByDescending { it.updatedAt }.take(150)
         _history.value = sorted
         historyWriteJob?.cancel()
-        persistAsync(historyFile, json.encodeToString(sorted))
+        persistLatestAsync(historyFile) { json.encodeToString(_history.value) }
     }
 
     @Synchronized
@@ -375,6 +499,6 @@ class LocalStore(context: Context) {
         if (additions.isEmpty()) return
         val next = (_favorites.value + additions).sortedByDescending { it.addedAt }
         _favorites.value = next
-        persistAsync(favoritesFile, json.encodeToString(next))
+        persistLatestAsync(favoritesFile) { json.encodeToString(_favorites.value) }
     }
 }

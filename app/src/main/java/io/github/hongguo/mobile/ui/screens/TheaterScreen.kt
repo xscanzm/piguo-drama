@@ -50,6 +50,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -67,6 +69,7 @@ import io.github.hongguo.mobile.core.CatalogCategory
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.GenreItem
 import io.github.hongguo.mobile.core.SearchCursor
+import io.github.hongguo.mobile.core.friendlyErrorMessage
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.theme.BgBlack
 import io.github.hongguo.mobile.ui.theme.CoralRed
@@ -75,6 +78,9 @@ import io.github.hongguo.mobile.ui.theme.SurfaceDark
 import io.github.hongguo.mobile.ui.theme.SurfaceElevated
 import io.github.hongguo.mobile.ui.theme.TextPrimary
 import io.github.hongguo.mobile.ui.theme.TextSecondary
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -104,28 +110,43 @@ fun TheaterScreen(
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     val gridState = rememberLazyGridState()
+    val searchFocusRequester = remember { FocusRequester() }
+    var requestJob by remember { mutableStateOf<Job?>(null) }
+    var requestSeq by remember { mutableIntStateOf(0) }
 
     fun loadCatalog(reset: Boolean) {
-        scope.launch {
+        requestJob?.cancel()
+        val mySeq = ++requestSeq
+        val cat = selectedCategory
+        val genre = selectedGenre
+        requestJob = scope.launch {
             loading = true
             errorMsg = null
             try {
                 val targetPage = if (reset) 1 else page + 1
-                val res = container.apiClient.fetchCatalog(selectedCategory, selectedGenre, targetPage, forceRefresh = reset)
+                val res = container.apiClient.fetchCatalog(cat, genre, targetPage, forceRefresh = reset)
+                if (mySeq != requestSeq) return@launch
                 if (reset) {
                     items = res.items
                     page = 1
                     genres = res.genres
+                    gridState.scrollToItem(0)
                 } else {
                     val seen = items.mapTo(HashSet()) { it.seriesId }
                     items = items + res.items.filter { seen.add(it.seriesId) }
                     page = res.page
                 }
                 hasMore = res.hasMore
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                errorMsg = e.message ?: "加载失败"
+                if (mySeq == requestSeq) {
+                    errorMsg = friendlyErrorMessage(e, "剧场加载失败，请稍后重试")
+                }
             } finally {
-                loading = false
+                if (mySeq == requestSeq) {
+                    loading = false
+                }
             }
         }
     }
@@ -141,15 +162,19 @@ fun TheaterScreen(
         if (reset) {
             container.localStore.addSearchHistory(kw)
         }
-        scope.launch {
+        requestJob?.cancel()
+        val mySeq = ++requestSeq
+        requestJob = scope.launch {
             loading = true
             errorMsg = null
             try {
                 val targetPage = if (reset) 1 else page + 1
                 val res = container.apiClient.searchDramas(kw, targetPage, if (reset) null else searchCursor)
+                if (mySeq != requestSeq) return@launch
                 if (reset) {
                     items = res.items
                     page = 1
+                    gridState.scrollToItem(0)
                 } else {
                     val seen = items.mapTo(HashSet()) { it.seriesId }
                     items = items + res.items.filter { seen.add(it.seriesId) }
@@ -157,10 +182,16 @@ fun TheaterScreen(
                 }
                 searchCursor = res.cursor
                 hasMore = res.hasMore
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                errorMsg = e.message ?: "搜索失败"
+                if (mySeq == requestSeq) {
+                    errorMsg = friendlyErrorMessage(e, "搜索失败，请稍后重试")
+                }
             } finally {
-                loading = false
+                if (mySeq == requestSeq) {
+                    loading = false
+                }
             }
         }
     }
@@ -184,6 +215,10 @@ fun TheaterScreen(
                 activeSearchKeyword = kw
             }
             onConsumeInitialSearchKeyword()
+        } else if (focusSearchTrigger > 0) {
+            delay(80L)
+            runCatching { searchFocusRequester.requestFocus() }
+            keyboard?.show()
         }
     }
 
@@ -241,7 +276,9 @@ fun TheaterScreen(
                         keyboard?.hide()
                         activeSearchKeyword = searchQuery.trim()
                     }),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(searchFocusRequester)
                 )
             }
             if (searchQuery.isNotEmpty() || activeSearchKeyword.isNotEmpty()) {
@@ -439,6 +476,36 @@ fun TheaterScreen(
                                 .padding(16.dp)
                         ) {
                             CircularProgressIndicator(color = CoralRed, modifier = Modifier.size(28.dp))
+                        }
+                    }
+                } else if (errorMsg != null) {
+                    item(span = { GridItemSpan(3) }) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp, horizontal = 8.dp)
+                        ) {
+                            Text(
+                                text = errorMsg.orEmpty(),
+                                color = TextSecondary,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "点击重试",
+                                color = CoralRed,
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clickable {
+                                    if (activeSearchKeyword.isEmpty()) loadCatalog(reset = false)
+                                    else executeSearch(reset = false)
+                                }
+                            )
                         }
                     }
                 }

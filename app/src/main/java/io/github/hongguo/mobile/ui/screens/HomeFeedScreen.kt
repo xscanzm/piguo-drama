@@ -68,6 +68,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.hongguo.mobile.AppContainer
 import io.github.hongguo.mobile.core.CatalogCategory
 import io.github.hongguo.mobile.core.DramaDetail
@@ -78,7 +80,10 @@ import io.github.hongguo.mobile.core.HomeFeedEndedAction
 import io.github.hongguo.mobile.core.QualityPreference
 import io.github.hongguo.mobile.core.RelatedDramaBundle
 import io.github.hongguo.mobile.core.SeriesSeasonMatcher
+import io.github.hongguo.mobile.core.friendlyErrorMessage
 import io.github.hongguo.mobile.core.resolveHomeFeedEndedAction
+import io.github.hongguo.mobile.player.ActivePlaybackMeta
+import io.github.hongguo.mobile.player.PlaybackRemoteCommand
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
@@ -93,6 +98,8 @@ import io.github.hongguo.mobile.ui.components.SpeedQualitySheet
 import io.github.hongguo.mobile.ui.components.VerticalDramaPlayer
 import io.github.hongguo.mobile.ui.components.enterPipMode
 import io.github.hongguo.mobile.ui.theme.CoralRed
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -125,6 +132,7 @@ fun HomeFeedScreen(
     onOpenSearch: (keyword: String?) -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val settings by container.localStore.settings.collectAsState()
     val favorites by container.localStore.favorites.collectAsState()
@@ -132,6 +140,7 @@ fun HomeFeedScreen(
     val authSession by container.localStore.authSession.collectAsState()
     val feedPrefs by container.localStore.feedPreferences.collectAsState()
     val inPip by container.isInPipMode.collectAsState()
+    val networkStatus by container.networkMonitor.status.collectAsState()
     val sleepState by container.sleepTimer.state.collectAsState()
 
     val channels = remember {
@@ -176,6 +185,7 @@ fun HomeFeedScreen(
     var hasMore by remember { mutableStateOf(true) }
     var feedLoading by remember { mutableStateOf(false) }
     var feedError by remember { mutableStateOf<String?>(null) }
+    val pagerState = rememberPagerState(pageCount = { feedItems.size })
 
     val episodeStates = remember {
         mutableStateMapOf<String, FeedEpisodeState>().apply {
@@ -232,9 +242,27 @@ fun HomeFeedScreen(
     var sessionExcludedIds by remember { mutableStateOf(initialBootState.first) }
     var handledInitialBoot by remember { mutableStateOf(false) }
     val preloadedNextEpisodeSeries = remember { mutableSetOf<String>() }
+    val autoRecoveredSeries = remember { mutableStateMapOf<String, Int>() }
+    var feedLoadJob by remember { mutableStateOf<Job?>(null) }
+    var feedLoadSeq by remember { mutableIntStateOf(0) }
+    val busOwnerId = remember { "home_feed_${System.nanoTime()}" }
+    var isCurFeedPlaying by remember { mutableStateOf(false) }
+    var remoteCmdSeq by remember { mutableIntStateOf(0) }
+    var remoteCommandTrigger by remember { mutableStateOf<Pair<Int, PlaybackRemoteCommand>?>(null) }
+    val initialSleepTrigger = remember { sleepState.triggerCount }
+    var showSleepEndedHint by remember { mutableStateOf(false) }
 
-    DisposableEffect(Unit) {
+    LaunchedEffect(sleepState.triggerCount) {
+        if (sleepState.triggerCount > initialSleepTrigger) {
+            showSleepEndedHint = true
+            delay(3_000L)
+            showSleepEndedHint = false
+        }
+    }
+
+    DisposableEffect(busOwnerId) {
         onDispose {
+            container.playbackControlBus.clearIfOwner(busOwnerId)
             container.localStore.flushSeenFeed()
             container.localStore.flushWatchHistory()
         }
@@ -258,8 +286,8 @@ fun HomeFeedScreen(
     val qualityPref = remember(settings.quality) {
         QualityPreference.entries.firstOrNull { it.key == settings.quality } ?: QualityPreference.AUTO
     }
-    val effectiveQuality = remember(settings.quality, settings.cellularAutoLowQuality) {
-        container.mediaCache.effectiveQuality(settings)
+    val effectiveQuality = remember(settings.quality, settings.cellularAutoLowQuality, networkStatus.isWifi) {
+        container.mediaCache.effectiveQuality(settings, networkStatus.isWifi)
     }
 
     fun filterFeed(
@@ -283,9 +311,15 @@ fun HomeFeedScreen(
         }
     }
 
-    fun loadFeed(reset: Boolean, appendFreshFirstPage: Boolean = false) {
+    fun loadFeed(
+        reset: Boolean,
+        appendFreshFirstPage: Boolean = false,
+        scrollToTopAfter: Boolean = false
+    ) {
+        feedLoadJob?.cancel()
+        val mySeq = ++feedLoadSeq
         val cat = channels[selectedChannelIdx].first
-        scope.launch {
+        feedLoadJob = scope.launch {
             feedLoading = true
             feedError = null
             try {
@@ -327,6 +361,7 @@ fun HomeFeedScreen(
                     }
                     targetPage = res.page + 1
                 }
+                if (mySeq != feedLoadSeq) return@launch
                 if (reset && filteredNow.isEmpty() && accumulatedRaw.isNotEmpty()) {
                     sessionExcludedIds = emptySet()
                     filteredNow = filterFeed(accumulatedRaw, settings.feedQualityFilter, emptySet())
@@ -334,12 +369,19 @@ fun HomeFeedScreen(
                 rawFeedItems = accumulatedRaw
                 feedItems = filteredNow
                 hasMore = localHasMore
+                if (scrollToTopAfter && filteredNow.isNotEmpty()) {
+                    pagerState.scrollToPage(0)
+                }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                if (!appendFreshFirstPage || feedItems.isEmpty()) {
-                    feedError = e.message ?: "推荐流加载失败"
+                if (mySeq == feedLoadSeq && (!appendFreshFirstPage || feedItems.isEmpty())) {
+                    feedError = friendlyErrorMessage(e, "推荐流加载失败，请稍后重试")
                 }
             } finally {
-                feedLoading = false
+                if (mySeq == feedLoadSeq) {
+                    feedLoading = false
+                }
             }
         }
     }
@@ -370,13 +412,10 @@ fun HomeFeedScreen(
         }
     }
 
-    val pagerState = rememberPagerState(pageCount = { feedItems.size })
-
     LaunchedEffect(refreshTrigger) {
         if (refreshTrigger > 0) {
             episodeStates.clear()
-            loadFeed(reset = true)
-            pagerState.scrollToPage(0)
+            loadFeed(reset = true, scrollToTopAfter = true)
         }
     }
 
@@ -387,10 +426,70 @@ fun HomeFeedScreen(
         }
     }
 
-    // Record a series as seen only after genuine dwell (>= 1.5s) on the active feed page
-    LaunchedEffect(pagerState.currentPage, feedItems, isRouteVisible, selectedChannelIdx) {
-        if (!isRouteVisible) return@LaunchedEffect
-        val cur = feedItems.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
+    // Record a series as seen only after genuine dwell (>= 1.5s) on a playable feed page
+    val curFeedItem = feedItems.getOrNull(pagerState.currentPage)
+    val curFeedState = curFeedItem?.let { episodeStates[it.seriesId] }
+    val curFeedPlayableReady = curFeedState?.media != null && curFeedState.error == null
+    LaunchedEffect(
+        isRouteVisible,
+        inPip,
+        settings.backgroundAudioPlay,
+        curFeedItem?.seriesId,
+        curFeedState?.detail?.title,
+        curFeedState?.episodeIndex,
+        isCurFeedPlaying,
+        pagerState.currentPage,
+        feedItems.size,
+        curVideoW,
+        curVideoH
+    ) {
+        val shouldPublish = curFeedItem != null &&
+            (isRouteVisible || inPip || (settings.backgroundAudioPlay && isCurFeedPlaying))
+        if (shouldPublish) {
+            val totalEps = curFeedState?.detail?.episodes?.size ?: curFeedItem!!.episodeCount
+            container.playbackControlBus.updateMeta(
+                ActivePlaybackMeta(
+                    ownerId = busOwnerId,
+                    seriesId = curFeedItem.seriesId,
+                    title = curFeedState?.detail?.title?.ifBlank { curFeedItem.title } ?: curFeedItem.title,
+                    episodeIndex = curFeedState?.episodeIndex ?: curFeedItem.initialEpisodeIndex,
+                    totalEpisodes = totalEps,
+                    isPlaying = isCurFeedPlaying,
+                    canSkipNext = pagerState.currentPage + 1 < feedItems.size,
+                    videoWidth = curVideoW,
+                    videoHeight = curVideoH,
+                    active = true
+                )
+            )
+        } else {
+            container.playbackControlBus.clearIfOwner(busOwnerId)
+        }
+    }
+
+    LaunchedEffect(busOwnerId) {
+        container.playbackControlBus.commands.collect { cmd ->
+            if (container.playbackControlBus.meta.value.ownerId != busOwnerId) return@collect
+            when (cmd) {
+                PlaybackRemoteCommand.NEXT_EPISODE -> {
+                    val nextPage = pagerState.currentPage + 1
+                    if (nextPage < feedItems.size) {
+                        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            pagerState.animateScrollToPage(nextPage)
+                        } else {
+                            pagerState.scrollToPage(nextPage)
+                        }
+                    }
+                }
+                else -> {
+                    remoteCommandTrigger = (++remoteCmdSeq) to cmd
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(curFeedItem?.seriesId, curFeedPlayableReady, isRouteVisible, selectedChannelIdx) {
+        if (!isRouteVisible || !curFeedPlayableReady) return@LaunchedEffect
+        val cur = curFeedItem ?: return@LaunchedEffect
         val channelKey = channels[selectedChannelIdx].first.key
         delay(1500L)
         container.localStore.markFeedSeen(cur.seriesId, cur.recFilterInfo)
@@ -421,6 +520,13 @@ fun HomeFeedScreen(
     // Resolve current page's detail & playable video, plus preload next drama's episode
     LaunchedEffect(pagerState.currentPage, feedItems, effectiveQuality, retryTick) {
         if (feedItems.isEmpty()) return@LaunchedEffect
+        if (episodeStates.size > 40) {
+            val keepStart = (pagerState.currentPage - 15).coerceAtLeast(0)
+            val keepEnd = (pagerState.currentPage + 15).coerceAtMost(feedItems.lastIndex)
+            val keepIds = (keepStart..keepEnd).mapTo(HashSet()) { feedItems[it].seriesId }
+            val toRemove = episodeStates.keys.filter { it !in keepIds }
+            toRemove.forEach { episodeStates.remove(it) }
+        }
         val curItem = feedItems.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
         val existing = episodeStates[curItem.seriesId]
         if (existing?.media == null && existing?.loading != true) {
@@ -481,10 +587,12 @@ fun HomeFeedScreen(
                         error = null
                     )
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 episodeStates[curItem.seriesId] = (
                     episodeStates[curItem.seriesId] ?: FeedEpisodeState(episodeIndex = curItem.initialEpisodeIndex)
-                    ).copy(loading = false, error = e.message ?: "片源准备失败")
+                    ).copy(loading = false, error = friendlyErrorMessage(e, "片源准备失败，请点击重试"))
             }
         }
 
@@ -664,8 +772,28 @@ fun HomeFeedScreen(
                         sleepTriggerCount = sleepState.triggerCount,
                         topSafeClearanceDp = effectiveTopClearanceDp,
                         bottomOverlayClearanceDp = effectiveBottomClearanceDp,
+                        canAutoRecover = (autoRecoveredSeries[drama.seriesId] ?: 0) < 1,
+                        onAutoRecover = {
+                            val count = autoRecoveredSeries[drama.seriesId] ?: 0
+                            if (count < 1) {
+                                autoRecoveredSeries[drama.seriesId] = count + 1
+                                val targetVid = epState.detail?.episodes?.getOrNull(epState.episodeIndex - 1)?.vid
+                                    ?: drama.initialVid
+                                if (targetVid.isNotBlank()) {
+                                    container.mediaCache.invalidateSource(targetVid, effectiveQuality)
+                                }
+                                episodeStates[drama.seriesId] = epState.copy(media = null, loading = false, error = null)
+                                retryTick++
+                            }
+                        },
                         onRetry = {
-                            episodeStates.remove(drama.seriesId)
+                            autoRecoveredSeries.remove(drama.seriesId)
+                            val targetVid = epState.detail?.episodes?.getOrNull(epState.episodeIndex - 1)?.vid
+                                ?: drama.initialVid
+                            if (targetVid.isNotBlank()) {
+                                container.mediaCache.invalidateSource(targetVid, effectiveQuality)
+                            }
+                            episodeStates[drama.seriesId] = epState.copy(media = null, loading = false, error = null)
                             retryTick++
                         },
                         onEnded = {
@@ -722,6 +850,10 @@ fun HomeFeedScreen(
                             }
                         },
                         onFlushProgress = { container.localStore.flushSeenFeed() },
+                        onPlaybackPlayingChange = { playing ->
+                            if (isPageActive) isCurFeedPlaying = playing
+                        },
+                        remoteCommandTrigger = if (isPageActive) remoteCommandTrigger else null,
                         showSeekBar = !cleanMode,
                         showFullscreenHint = !cleanMode
                     )
@@ -1034,7 +1166,12 @@ fun HomeFeedScreen(
                                 .background(Color.Black.copy(alpha = 0.48f))
                                 .clickable {
                                     isFullscreen = false
-                                    context.enterPipMode(curVideoW, curVideoH)
+                                    context.enterPipMode(
+                                        videoWidth = curVideoW,
+                                        videoHeight = curVideoH,
+                                        isPlaying = isCurFeedPlaying,
+                                        canSkipNext = pagerState.currentPage + 1 < feedItems.size
+                                    )
                                 }
                                 .padding(horizontal = 10.dp, vertical = 6.dp)
                         ) {
@@ -1140,11 +1277,8 @@ fun HomeFeedScreen(
                     Spacer(Modifier.width(6.dp))
                     IconButton(
                         onClick = {
-                            scope.launch {
-                                episodeStates.clear()
-                                loadFeed(reset = true)
-                                pagerState.scrollToPage(0)
-                            }
+                            episodeStates.clear()
+                            loadFeed(reset = true, scrollToTopAfter = true)
                         },
                         modifier = Modifier
                             .size(34.dp)
@@ -1224,6 +1358,29 @@ fun HomeFeedScreen(
                         )
                     }
                 }
+            }
+        }
+        AnimatedVisibility(
+            visible = showSleepEndedHint && !inPip,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 58.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color.Black.copy(alpha = 0.78f))
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Text(
+                    text = "睡眠定时已到，已自动暂停播放",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
         }
     }
@@ -1347,9 +1504,21 @@ fun HomeFeedScreen(
     }
 
     if (showSpeedSheet) {
+        val curDramaForSheet = feedItems.getOrNull(pagerState.currentPage)
+        val curMediaForSheet = curDramaForSheet?.let { episodeStates[it.seriesId]?.media }
+        val activeQualityText = curMediaForSheet?.let { m ->
+            listOf(m.qualityLabel, m.codec.uppercase())
+                .filter { it.isNotBlank() && !it.equals("CACHED", ignoreCase = true) }
+                .joinToString(" · ")
+        }?.ifBlank { effectiveQuality.label.substringBefore(" ") }
+            ?: effectiveQuality.label.substringBefore(" ")
+        val isDowngraded = settings.cellularAutoLowQuality && !networkStatus.isWifi && qualityPref != effectiveQuality
+
         SpeedQualitySheet(
             currentSpeed = settings.playbackSpeed,
             currentQuality = qualityPref,
+            activeQualityInfo = activeQualityText,
+            isCellularDowngraded = isDowngraded,
             fitModeFill = settings.fitModeFill,
             onSelectFitMode = { fill ->
                 container.localStore.updateSettings { it.copy(fitModeFill = fill, fitModeUserChosen = true) }
@@ -1358,7 +1527,14 @@ fun HomeFeedScreen(
             onSelectSleepTimer = { mode -> container.sleepTimer.setMode(mode) },
             backgroundAudioPlay = settings.backgroundAudioPlay,
             onToggleBackgroundAudio = { on -> container.localStore.updateSettings { it.copy(backgroundAudioPlay = on) } },
-            onEnterPip = { context.enterPipMode(curVideoW, curVideoH) },
+            onEnterPip = {
+                context.enterPipMode(
+                    videoWidth = curVideoW,
+                    videoHeight = curVideoH,
+                    isPlaying = isCurFeedPlaying,
+                    canSkipNext = pagerState.currentPage + 1 < feedItems.size
+                )
+            },
             onSelectSpeed = { spd -> container.localStore.updateSettings { it.copy(playbackSpeed = spd) } },
             onSelectQuality = { q ->
                 val curDrama = feedItems.getOrNull(pagerState.currentPage)
@@ -1367,7 +1543,12 @@ fun HomeFeedScreen(
                     qualityResumeBySeries = curDrama.seriesId to pos
                 }
                 container.localStore.updateSettings { it.copy(quality = q.key) }
-                episodeStates.clear()
+                val keys = episodeStates.keys.toList()
+                for (k in keys) {
+                    episodeStates[k]?.let { st ->
+                        episodeStates[k] = st.copy(media = null, loading = false, error = null)
+                    }
+                }
                 retryTick++
             },
             onDismiss = { showSpeedSheet = false }

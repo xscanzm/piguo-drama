@@ -2,8 +2,11 @@
 // Port of CENC-AES-CTR MP4 sample decryptor & moov box rebuilder from jackotom/hongguo-drama src/native/hongguo.js.
 package io.github.hongguo.mobile.core
 
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
@@ -171,7 +174,7 @@ object Mp4CencDecryptor {
         return serialize(tree)
     }
 
-    fun decryptBytes(data: ByteArray, key16: ByteArray): ByteArray {
+    private fun decryptAndWrite(data: ByteArray, key16: ByteArray, out: OutputStream) {
         val total = data.size
         val top = parseBoxes(data, 0, total)
         val moov = top.firstOrNull { it.typ == "moov" } ?: error("no moov box found in MP4")
@@ -246,7 +249,6 @@ object Mp4CencDecryptor {
         }
 
         val newMoov = rebuildMoov(data, moov.off, moov.size, top)
-        val out = ByteArrayOutputStream(total)
         var off = 0
         while (off < total) {
             var size = readU32(data, off)
@@ -264,12 +266,18 @@ object Mp4CencDecryptor {
             }
             off += size.toInt()
         }
+    }
+
+    fun decryptBytes(data: ByteArray, key16: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream(data.size)
+        decryptAndWrite(data, key16, out)
         return out.toByteArray()
     }
 
     fun decryptFile(inputFile: File, outputFile: File, key16: ByteArray) {
         val raw = inputFile.readBytes()
-        val decrypted = decryptBytes(raw, key16)
-        outputFile.writeBytes(decrypted)
+        BufferedOutputStream(FileOutputStream(outputFile), 64 * 1024).use { out ->
+            decryptAndWrite(raw, key16, out)
+        }
     }
 }

@@ -258,9 +258,9 @@ fun EpisodePickerSheet(
             }
 
             Spacer(Modifier.height(14.dp))
-            val startIdx = selectedRange * pageSize
+            val startIdx = (selectedRange * pageSize).coerceIn(0, total)
             val endIdx = minOf(startIdx + pageSize, total)
-            val slice = detail.episodes.subList(startIdx, endIdx)
+            val slice = if (startIdx < endIdx) detail.episodes.subList(startIdx, endIdx) else emptyList()
 
             LazyVerticalGrid(
                 columns = GridCells.Fixed(5),
@@ -342,6 +342,8 @@ fun EpisodePickerSheet(
 fun SpeedQualitySheet(
     currentSpeed: Float,
     currentQuality: QualityPreference,
+    activeQualityInfo: String? = null,
+    isCellularDowngraded: Boolean = false,
     fitModeFill: Boolean = false,
     onSelectFitMode: (Boolean) -> Unit = {},
     sleepTimerState: SleepTimerState = SleepTimerState(),
@@ -399,7 +401,25 @@ fun SpeedQualitySheet(
             }
 
             Spacer(Modifier.height(16.dp))
-            Text("清晰度偏好", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("清晰度偏好", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                val qualityBadgeText = when {
+                    isCellularDowngraded -> "移动省流 · ${activeQualityInfo ?: "480P"}"
+                    !activeQualityInfo.isNullOrBlank() -> "当前 $activeQualityInfo"
+                    else -> ""
+                }
+                if (qualityBadgeText.isNotEmpty()) {
+                    Text(
+                        text = qualityBadgeText,
+                        color = if (isCellularDowngraded) Color(0xFFFFD54F) else TextSecondary,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
             Spacer(Modifier.height(8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 QualityPreference.entries.chunked(3).forEach { rowItems ->

@@ -89,6 +89,31 @@ class HongguoApiClient(
     private val catalogGenres = ConcurrentHashMap<String, List<GenreItem>>()
     private val detailCache = ConcurrentHashMap<String, Pair<Long, DramaDetail>>()
 
+    private fun <V> pruneTimedCache(
+        map: ConcurrentHashMap<String, Pair<Long, V>>,
+        maxEntries: Int,
+        isExpired: (Long, Long) -> Boolean
+    ) {
+        if (map.size <= maxEntries) return
+        val now = System.currentTimeMillis()
+        val it = map.entries.iterator()
+        while (it.hasNext()) {
+            if (isExpired(it.next().value.first, now)) it.remove()
+        }
+        if (map.size > maxEntries) {
+            val surplus = map.size - maxEntries
+            map.entries
+                .sortedBy { it.value.first }
+                .take(surplus)
+                .forEach { map.remove(it.key) }
+        }
+    }
+
+    fun trimMemoryCaches() {
+        pruneTimedCache(detailCache, 30) { expiresAt, now -> expiresAt <= now }
+        pruneTimedCache(prefetchedVariantsCache, 30) { createdAt, now -> now - createdAt >= 4 * 60_000L }
+    }
+
     private fun currentCookieHeader(): String? =
         authSessionProvider()?.cookieHeader?.takeIf { it.isNotBlank() }
 
@@ -680,6 +705,7 @@ class HongguoApiClient(
                         isCompleted = resolvedCompleted
                     )
                 )
+                pruneTimedCache(detailCache, 80) { expiresAt, now -> expiresAt <= now }
             }
         }
 
@@ -702,6 +728,9 @@ class HongguoApiClient(
                     )
                     if (parsed.variants.isNotEmpty()) {
                         prefetchedVariantsCache[vid] = System.currentTimeMillis() to parsed.variants
+                        pruneTimedCache(prefetchedVariantsCache, 120) { createdAt, now ->
+                            now - createdAt >= 4 * 60_000L
+                        }
                     }
                 }
             }
@@ -1359,6 +1388,7 @@ class HongguoApiClient(
     fun warmDetailCache(detail: DramaDetail) {
         if (detail.seriesId.isNotBlank() && detail.episodes.isNotEmpty()) {
             detailCache.putIfAbsent(detail.seriesId, (System.currentTimeMillis() + 300_000L) to detail)
+            pruneTimedCache(detailCache, 80) { expiresAt, now -> expiresAt <= now }
         }
     }
 
@@ -1522,6 +1552,7 @@ class HongguoApiClient(
         val appResult = runCatching { fetchSeriesDetailFromApp(seriesId) }.getOrNull()
         val result = appResult ?: fetchSeriesDetailFromWeb(seriesId)
         detailCache[seriesId] = (System.currentTimeMillis() + 300_000L) to result
+        pruneTimedCache(detailCache, 80) { expiresAt, now -> expiresAt <= now }
         result
     }
 

@@ -5,6 +5,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -38,6 +39,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -59,17 +61,27 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.hongguo.mobile.AppContainer
 import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.QualityPreference
 import io.github.hongguo.mobile.core.RelatedDramaBundle
+import io.github.hongguo.mobile.core.ResumePlaybackState
 import io.github.hongguo.mobile.core.SeriesSeasonMatcher
+import io.github.hongguo.mobile.core.friendlyErrorMessage
+import io.github.hongguo.mobile.core.isSeriesCompleted
 import io.github.hongguo.mobile.core.shouldRecordWatchHistory
+import io.github.hongguo.mobile.player.ActivePlaybackMeta
+import io.github.hongguo.mobile.player.PlaybackRemoteCommand
 import io.github.hongguo.mobile.player.ResolvedMediaSource
+import io.github.hongguo.mobile.player.SleepTimerManager
+import io.github.hongguo.mobile.player.SleepTimerMode
 import io.github.hongguo.mobile.ui.components.DramaDetailSheet
 import io.github.hongguo.mobile.ui.components.DramaQualitySheet
 import io.github.hongguo.mobile.ui.components.EpisodePickerSheet
@@ -78,6 +90,8 @@ import io.github.hongguo.mobile.ui.components.SpeedQualitySheet
 import io.github.hongguo.mobile.ui.components.VerticalDramaPlayer
 import io.github.hongguo.mobile.ui.components.enterPipMode
 import io.github.hongguo.mobile.ui.theme.CoralRed
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private data class EpisodeLoadState(
@@ -92,17 +106,20 @@ fun DramaSeriesPlayerScreen(
     seriesId: String,
     initialEpisodeIndex: Int,
     initialPositionMs: Long,
+    autoResumed: Boolean = false,
     onBack: () -> Unit,
     onSwitchSeries: (seriesId: String) -> Unit = {},
     onSearchAll: (keyword: String) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val settings by container.localStore.settings.collectAsState()
     val favorites by container.localStore.favorites.collectAsState()
     val history by container.localStore.history.collectAsState()
     val inPip by container.isInPipMode.collectAsState()
+    val networkStatus by container.networkMonitor.status.collectAsState()
     val sleepState by container.sleepTimer.state.collectAsState()
 
     var detail by remember(seriesId) { mutableStateOf<DramaDetail?>(container.apiClient.peekSeriesDetail(seriesId)) }
@@ -113,8 +130,8 @@ fun DramaSeriesPlayerScreen(
     val qualityPref = remember(settings.quality) {
         QualityPreference.entries.firstOrNull { it.key == settings.quality } ?: QualityPreference.AUTO
     }
-    val effectiveQuality = remember(settings.quality, settings.cellularAutoLowQuality) {
-        container.mediaCache.effectiveQuality(settings)
+    val effectiveQuality = remember(settings.quality, settings.cellularAutoLowQuality, networkStatus.isWifi) {
+        container.mediaCache.effectiveQuality(settings, networkStatus.isWifi)
     }
 
     LaunchedEffect(seriesId, detailRetryTick) {
@@ -122,9 +139,11 @@ fun DramaSeriesPlayerScreen(
             detailLoading = true
             detailError = null
             try {
-                detail = container.apiClient.fetchSeriesDetail(seriesId)
+                detail = container.apiClient.fetchSeriesDetail(seriesId, forceRefresh = detailRetryTick > 0)
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                detailError = e.message ?: "剧集信息加载失败"
+                detailError = friendlyErrorMessage(e, "剧集信息加载失败，请重试")
             } finally {
                 detailLoading = false
             }
@@ -132,7 +151,7 @@ fun DramaSeriesPlayerScreen(
     }
 
     val loadedDetail = detail
-    if (loadedDetail == null) {
+    if (loadedDetail == null || loadedDetail.episodes.isEmpty()) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -153,7 +172,12 @@ fun DramaSeriesPlayerScreen(
                     CircularProgressIndicator(color = CoralRed)
                 } else {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                        Text(detailError ?: "加载失败", color = Color.White, fontSize = 15.sp)
+                        Text(
+                            text = detailError ?: if (loadedDetail != null) "暂无可播分集" else "加载失败",
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            textAlign = TextAlign.Center
+                        )
                         Spacer(Modifier.height(12.dp))
                         Button(
                             onClick = { detailRetryTick++ },
@@ -169,9 +193,39 @@ fun DramaSeriesPlayerScreen(
     val startPage = (initialEpisodeIndex - 1).coerceIn(0, (loadedDetail.episodes.size - 1).coerceAtLeast(0))
     val pagerState = rememberPagerState(initialPage = startPage, pageCount = { loadedDetail.episodes.size })
     val episodeStates = remember(loadedDetail.seriesId) { mutableStateMapOf<String, EpisodeLoadState>() }
+    val autoRecoveredVids = remember(loadedDetail.seriesId) { mutableStateMapOf<String, Int>() }
     val livePositions = remember(loadedDetail.seriesId) { mutableStateMapOf<Int, Long>() }
     var qualityResumePos by remember(loadedDetail.seriesId) { mutableStateOf<Pair<Int, Long>?>(null) }
     var mediaRetryTick by remember { mutableIntStateOf(0) }
+    var replayTrigger by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
+    var showSeriesEndedCard by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var showAutoResumeBanner by remember(loadedDetail.seriesId, autoResumed) { mutableStateOf(autoResumed) }
+    val busOwnerId = remember(loadedDetail.seriesId) { "series_${loadedDetail.seriesId}_${System.nanoTime()}" }
+    var isCurEpPlaying by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var remoteCmdSeq by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
+    var remoteCommandTrigger by remember(loadedDetail.seriesId) { mutableStateOf<Pair<Int, PlaybackRemoteCommand>?>(null) }
+    val initialSleepTrigger = remember { sleepState.triggerCount }
+    var showSleepEndedHint by remember { mutableStateOf(false) }
+
+    fun exitExplicitly() {
+        container.localStore.clearResumePlayback()
+        onBack()
+    }
+
+    LaunchedEffect(showAutoResumeBanner) {
+        if (showAutoResumeBanner) {
+            delay(3_500L)
+            showAutoResumeBanner = false
+        }
+    }
+
+    LaunchedEffect(sleepState.triggerCount) {
+        if (sleepState.triggerCount > initialSleepTrigger) {
+            showSleepEndedHint = true
+            delay(3_000L)
+            showSleepEndedHint = false
+        }
+    }
     var cleanMode by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
     var fullscreenControlsVisible by remember { mutableStateOf(true) }
@@ -233,18 +287,96 @@ fun DramaSeriesPlayerScreen(
         }
     }
 
-    DisposableEffect(Unit) {
-        onDispose { container.localStore.flushWatchHistory() }
+    DisposableEffect(busOwnerId) {
+        onDispose {
+            container.playbackControlBus.clearIfOwner(busOwnerId)
+            container.localStore.flushWatchHistory()
+            container.localStore.flushResumePlayback()
+        }
+    }
+
+    LaunchedEffect(
+        loadedDetail.seriesId,
+        loadedDetail.title,
+        pagerState.currentPage,
+        loadedDetail.episodes.size,
+        isCurEpPlaying,
+        curVideoW,
+        curVideoH
+    ) {
+        container.playbackControlBus.updateMeta(
+            ActivePlaybackMeta(
+                ownerId = busOwnerId,
+                seriesId = loadedDetail.seriesId,
+                title = loadedDetail.title,
+                episodeIndex = pagerState.currentPage + 1,
+                totalEpisodes = loadedDetail.episodes.size,
+                isPlaying = isCurEpPlaying,
+                canSkipNext = pagerState.currentPage + 1 < loadedDetail.episodes.size,
+                videoWidth = curVideoW,
+                videoHeight = curVideoH,
+                active = true
+            )
+        )
+    }
+
+    LaunchedEffect(busOwnerId) {
+        container.playbackControlBus.commands.collect { cmd ->
+            if (container.playbackControlBus.meta.value.ownerId != busOwnerId) return@collect
+            when (cmd) {
+                PlaybackRemoteCommand.NEXT_EPISODE -> {
+                    val nextPage = pagerState.currentPage + 1
+                    if (nextPage < loadedDetail.episodes.size) {
+                        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            pagerState.animateScrollToPage(nextPage)
+                        } else {
+                            pagerState.scrollToPage(nextPage)
+                        }
+                    }
+                }
+                else -> {
+                    remoteCommandTrigger = (++remoteCmdSeq) to cmd
+                }
+            }
+        }
     }
 
     LandscapeFullscreenEffect(isFullscreen)
     BackHandler(enabled = isFullscreen) {
         isFullscreen = false
     }
+    BackHandler(enabled = !isFullscreen) {
+        exitExplicitly()
+    }
 
     // Resolve current episode & preload next 1-2 episodes
     LaunchedEffect(pagerState.currentPage, loadedDetail, effectiveQuality, mediaRetryTick) {
+        showSeriesEndedCard = false
+        if (episodeStates.size > 35) {
+            val keepStart = (pagerState.currentPage - 15).coerceAtLeast(0)
+            val keepEnd = (pagerState.currentPage + 15).coerceAtMost(loadedDetail.episodes.lastIndex)
+            val keepVids = (keepStart..keepEnd).mapTo(HashSet()) { loadedDetail.episodes[it].vid }
+            val toRemove = episodeStates.keys.filter { it !in keepVids }
+            toRemove.forEach { episodeStates.remove(it) }
+        }
         val ep = loadedDetail.episodes.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
+        if (ep.index < 2) {
+            container.localStore.clearResumePlayback()
+        } else {
+            container.localStore.saveResumePlayback(
+                ResumePlaybackState(
+                    seriesId = loadedDetail.seriesId,
+                    title = loadedDetail.title,
+                    cover = loadedDetail.cover,
+                    vid = ep.vid,
+                    qualityKey = effectiveQuality.key,
+                    episodeIndex = ep.index,
+                    totalEpisodes = loadedDetail.episodes.size,
+                    positionMs = livePositions[ep.index] ?: 0L,
+                    durationMs = 0L
+                )
+            )
+        }
         val curState = episodeStates[ep.vid]
         if (curState?.media == null && curState?.loading != true) {
             val quickPeek = if (mediaRetryTick == 0) container.mediaCache.peekResolvedSource(ep.vid, effectiveQuality) else null
@@ -260,8 +392,13 @@ fun DramaSeriesPlayerScreen(
                         bypassCooldown = mediaRetryTick > 0
                     )
                     episodeStates[ep.vid] = EpisodeLoadState(media = resolved, loading = false)
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (e: Exception) {
-                    episodeStates[ep.vid] = EpisodeLoadState(loading = false, error = e.message ?: "片源加载失败")
+                    episodeStates[ep.vid] = EpisodeLoadState(
+                        loading = false,
+                        error = friendlyErrorMessage(e, "片源加载失败，请点击重试")
+                    )
                 }
             }
         }
@@ -330,20 +467,61 @@ fun DramaSeriesPlayerScreen(
                     sleepTriggerCount = sleepState.triggerCount,
                     topSafeClearanceDp = effectiveTopClearanceDp,
                     bottomOverlayClearanceDp = effectiveBottomClearanceDp,
+                    replayTrigger = if (isActive) replayTrigger else 0,
+                    canAutoRecover = (autoRecoveredVids[ep.vid] ?: 0) < 1,
+                    onAutoRecover = {
+                        val count = autoRecoveredVids[ep.vid] ?: 0
+                        if (count < 1) {
+                            autoRecoveredVids[ep.vid] = count + 1
+                            container.mediaCache.invalidateSource(ep.vid, effectiveQuality)
+                            episodeStates.remove(ep.vid)
+                            mediaRetryTick++
+                        }
+                    },
                     onRetry = {
+                        autoRecoveredVids.remove(ep.vid)
+                        container.mediaCache.invalidateSource(ep.vid, effectiveQuality)
                         episodeStates.remove(ep.vid)
                         mediaRetryTick++
                     },
                     onEnded = {
                         if (container.sleepTimer.consumeEpisodeEndTrigger()) return@VerticalDramaPlayer
                         if (settings.autoPlayNext && page + 1 < loadedDetail.episodes.size) {
-                            scope.launch { pagerState.animateScrollToPage(page + 1) }
+                            scope.launch {
+                                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                                    pagerState.animateScrollToPage(page + 1)
+                                } else {
+                                    pagerState.scrollToPage(page + 1)
+                                }
+                            }
+                        } else if (page + 1 >= loadedDetail.episodes.size && isActive) {
+                            container.localStore.clearResumePlayback()
+                            showSeriesEndedCard = true
                         }
                     },
                     onProgressUpdate = { pos, dur ->
                         if (ep.index == initialEpisodeIndex) usedInitialPos = true
                         if (qualityResumePos?.first == page) qualityResumePos = null
                         livePositions[ep.index] = pos
+                        if (isActive) {
+                            if (ep.index < 2 || isSeriesCompleted(ep.index, loadedDetail.episodes.size, pos, dur)) {
+                                container.localStore.clearResumePlayback()
+                            } else {
+                                container.localStore.saveResumePlayback(
+                                    ResumePlaybackState(
+                                        seriesId = loadedDetail.seriesId,
+                                        title = loadedDetail.title,
+                                        cover = loadedDetail.cover,
+                                        vid = ep.vid,
+                                        qualityKey = effectiveQuality.key,
+                                        episodeIndex = ep.index,
+                                        totalEpisodes = loadedDetail.episodes.size,
+                                        positionMs = pos,
+                                        durationMs = dur
+                                    )
+                                )
+                            }
+                        }
                         val alreadyInHistory = container.localStore.getLastWatchEntry(loadedDetail.seriesId) != null
                         if (shouldRecordWatchHistory(ep.index, pos, alreadyInHistory)) {
                             container.localStore.recordWatchProgress(
@@ -375,7 +553,14 @@ fun DramaSeriesPlayerScreen(
                             curVideoH = h
                         }
                     },
-                    onFlushProgress = { container.localStore.flushWatchHistory() },
+                    onFlushProgress = {
+                        container.localStore.flushWatchHistory()
+                        container.localStore.flushResumePlayback()
+                    },
+                    onPlaybackPlayingChange = { playing ->
+                        if (isActive) isCurEpPlaying = playing
+                    },
+                    remoteCommandTrigger = if (isActive) remoteCommandTrigger else null,
                     showSeekBar = !cleanMode,
                     showFullscreenHint = !cleanMode,
                     modifier = if (isFullscreen || inPip) Modifier else Modifier.navigationBarsPadding()
@@ -513,7 +698,7 @@ fun DramaSeriesPlayerScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 IconButton(
-                    onClick = { if (isFullscreen) isFullscreen = false else onBack() },
+                    onClick = { if (isFullscreen) isFullscreen = false else exitExplicitly() },
                     modifier = Modifier
                         .size(38.dp)
                         .background(Color.Black.copy(alpha = 0.4f), CircleShape)
@@ -532,7 +717,25 @@ fun DramaSeriesPlayerScreen(
                         .weight(1f)
                         .clickable { openDetailSheet() }
                 )
+                if (sleepState.mode != SleepTimerMode.OFF) {
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(CoralRed.copy(alpha = 0.28f))
+                            .clickable { showSpeedSheet = true }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = SleepTimerManager.formatRemaining(sleepState),
+                            color = Color(0xFFFFD0D8),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
                 if (isFullscreen) {
+                    Spacer(Modifier.width(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Box(
                             modifier = Modifier
@@ -549,7 +752,12 @@ fun DramaSeriesPlayerScreen(
                                 .background(Color.Black.copy(alpha = 0.48f))
                                 .clickable {
                                     isFullscreen = false
-                                    context.enterPipMode(curVideoW, curVideoH)
+                                    context.enterPipMode(
+                                        videoWidth = curVideoW,
+                                        videoHeight = curVideoH,
+                                        isPlaying = isCurEpPlaying,
+                                        canSkipNext = pagerState.currentPage + 1 < loadedDetail.episodes.size
+                                    )
                                 }
                                 .padding(horizontal = 10.dp, vertical = 6.dp)
                         ) {
@@ -576,6 +784,125 @@ fun DramaSeriesPlayerScreen(
                             ) {
                                 Text("下一集", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = (showAutoResumeBanner || showSleepEndedHint) && !cleanMode && !inPip,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 56.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .padding(horizontal = 16.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color.Black.copy(alpha = 0.8f))
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                if (showAutoResumeBanner) {
+                    Text(
+                        text = "已续播《${loadedDetail.title}》第${initialEpisodeIndex}集",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Text(
+                        text = "回首页",
+                        color = CoralRed,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable {
+                            showAutoResumeBanner = false
+                            exitExplicitly()
+                        }
+                    )
+                } else {
+                    Text(
+                        text = "睡眠定时已到，已自动暂停播放",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        if (showSeriesEndedCard && !inPip) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.62f))
+                    .clickable(onClick = {})
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 28.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Color(0xFF1A1A20).copy(alpha = 0.96f))
+                        .padding(horizontal = 22.dp, vertical = 22.dp)
+                ) {
+                    Text(
+                        text = "本季已全部看完",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "共 ${loadedDetail.episodes.size} 集 · 感谢观看「${loadedDetail.title}」",
+                        color = Color.White.copy(alpha = 0.72f),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Button(
+                        onClick = {
+                            showSeriesEndedCard = false
+                            openDetailSheet()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = CoralRed),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("查看系列 / 相关推荐", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                showSeriesEndedCard = false
+                                replayTrigger++
+                            },
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("重播本集", color = Color.White, fontSize = 13.sp)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                showSeriesEndedCard = false
+                                exitExplicitly()
+                            },
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("返回", color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
                         }
                     }
                 }
@@ -613,6 +940,7 @@ fun DramaSeriesPlayerScreen(
             },
             onSelectDrama = { targetId ->
                 showDetailSheet = false
+                container.localStore.clearResumePlayback()
                 onSwitchSeries(targetId)
             },
             onRetryRelated = { relatedReloadTick++ },
@@ -630,6 +958,7 @@ fun DramaSeriesPlayerScreen(
             },
             onSearchAll = { kw ->
                 showDetailSheet = false
+                container.localStore.clearResumePlayback()
                 onSearchAll(kw)
             },
             onDismiss = { showDetailSheet = false }
@@ -645,10 +974,11 @@ fun DramaSeriesPlayerScreen(
             seasons = relatedBundle?.seasons.orEmpty(),
             onSwitchSeason = { targetId ->
                 showEpisodeSheet = false
+                container.localStore.clearResumePlayback()
                 onSwitchSeries(targetId)
             },
             onSelectEpisode = { chosen ->
-                val target = (chosen - 1).coerceIn(0, loadedDetail.episodes.size - 1)
+                val target = (chosen - 1).coerceIn(0, (loadedDetail.episodes.size - 1).coerceAtLeast(0))
                 scope.launch { pagerState.scrollToPage(target) }
             },
             onDismiss = { showEpisodeSheet = false }
@@ -670,9 +1000,21 @@ fun DramaSeriesPlayerScreen(
     }
 
     if (showSpeedSheet) {
+        val curEpForSheet = loadedDetail.episodes.getOrNull(pagerState.currentPage)
+        val curMediaForSheet = curEpForSheet?.let { episodeStates[it.vid]?.media }
+        val activeQualityText = curMediaForSheet?.let { m ->
+            listOf(m.qualityLabel, m.codec.uppercase())
+                .filter { it.isNotBlank() && !it.equals("CACHED", ignoreCase = true) }
+                .joinToString(" · ")
+        }?.ifBlank { effectiveQuality.label.substringBefore(" ") }
+            ?: effectiveQuality.label.substringBefore(" ")
+        val isDowngraded = settings.cellularAutoLowQuality && !networkStatus.isWifi && qualityPref != effectiveQuality
+
         SpeedQualitySheet(
             currentSpeed = settings.playbackSpeed,
             currentQuality = qualityPref,
+            activeQualityInfo = activeQualityText,
+            isCellularDowngraded = isDowngraded,
             fitModeFill = settings.fitModeFill,
             onSelectFitMode = { fill ->
                 container.localStore.updateSettings { it.copy(fitModeFill = fill, fitModeUserChosen = true) }
@@ -681,7 +1023,14 @@ fun DramaSeriesPlayerScreen(
             onSelectSleepTimer = { mode -> container.sleepTimer.setMode(mode) },
             backgroundAudioPlay = settings.backgroundAudioPlay,
             onToggleBackgroundAudio = { on -> container.localStore.updateSettings { it.copy(backgroundAudioPlay = on) } },
-            onEnterPip = { context.enterPipMode(curVideoW, curVideoH) },
+            onEnterPip = {
+                context.enterPipMode(
+                    videoWidth = curVideoW,
+                    videoHeight = curVideoH,
+                    isPlaying = isCurEpPlaying,
+                    canSkipNext = pagerState.currentPage + 1 < loadedDetail.episodes.size
+                )
+            },
             onSelectSpeed = { spd -> container.localStore.updateSettings { it.copy(playbackSpeed = spd) } },
             onSelectQuality = { q ->
                 val curEp = loadedDetail.episodes.getOrNull(pagerState.currentPage)

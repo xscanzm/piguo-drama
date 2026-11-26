@@ -8,11 +8,14 @@ import java.nio.charset.StandardCharsets
 
 class FeedWarmCacheStore(
     private val file: File?,
-    private val maxEntries: Int = DEFAULT_MAX_ENTRIES
+    private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+    private val persistOnWrite: Boolean = true
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val entries = LinkedHashMap<String, WarmFeedEntry>()
     private val lock = Any()
+    @Volatile
+    private var dirty = false
 
     init {
         val sourceFile = file
@@ -66,9 +69,13 @@ class FeedWarmCacheStore(
                 it.next()
                 it.remove()
             }
+            dirty = true
             entries.values.toList()
         }
-        persistSnapshot(snapshot)
+        if (persistOnWrite) {
+            dirty = false
+            persistSnapshot(snapshot)
+        }
         return snapshot.size
     }
 
@@ -78,9 +85,13 @@ class FeedWarmCacheStore(
             if (cleanId.isEmpty() || entries.remove(cleanId) == null) {
                 return entries.size
             }
+            dirty = true
             entries.values.toList()
         }
-        persistSnapshot(snapshot)
+        if (persistOnWrite) {
+            dirty = false
+            persistSnapshot(snapshot)
+        }
         return snapshot.size
     }
 
@@ -98,9 +109,11 @@ class FeedWarmCacheStore(
                     changed = true
                 }
             }
+            if (changed) dirty = true
             entries.values.toList()
         }
-        if (changed) {
+        if (changed && persistOnWrite) {
+            dirty = false
             persistSnapshot(snapshot)
         }
         return snapshot
@@ -112,15 +125,31 @@ class FeedWarmCacheStore(
         val hadAny = synchronized(lock) {
             val wasNonEmpty = entries.isNotEmpty()
             entries.clear()
+            if (wasNonEmpty || file?.exists() == true) dirty = true
             wasNonEmpty
         }
-        if (hadAny || file?.exists() == true) {
+        if ((hadAny || file?.exists() == true) && persistOnWrite) {
+            dirty = false
             persistSnapshot(emptyList())
         }
     }
 
+    fun flush() {
+        val target = file ?: return
+        val snapshot = synchronized(lock) {
+            if (!dirty) return
+            dirty = false
+            entries.values.toList()
+        }
+        persistSnapshotToFile(target, snapshot)
+    }
+
     private fun persistSnapshot(snapshot: List<WarmFeedEntry>) {
         val target = file ?: return
+        persistSnapshotToFile(target, snapshot)
+    }
+
+    private fun persistSnapshotToFile(target: File, snapshot: List<WarmFeedEntry>) {
         runCatching {
             target.parentFile?.mkdirs()
             val tmp = File(target.parentFile, "${target.name}.tmp")

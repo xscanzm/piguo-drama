@@ -193,7 +193,22 @@ data class UserSettings(
     val feedQualityFilter: String = "all",
     val fitModeFill: Boolean = false,
     val fitModeUserChosen: Boolean = false,
-    val backgroundAudioPlay: Boolean = false
+    val backgroundAudioPlay: Boolean = false,
+    val autoResumeOnLaunch: Boolean = true
+)
+
+@Serializable
+data class ResumePlaybackState(
+    val seriesId: String,
+    val title: String,
+    val cover: String = "",
+    val vid: String = "",
+    val qualityKey: String = QualityPreference.AUTO.key,
+    val episodeIndex: Int,
+    val totalEpisodes: Int = 0,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val updatedAt: Long = System.currentTimeMillis()
 )
 
 @Serializable

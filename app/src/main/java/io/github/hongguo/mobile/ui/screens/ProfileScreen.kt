@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package io.github.hongguo.mobile.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -52,6 +57,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import io.github.hongguo.mobile.AppContainer
 import io.github.hongguo.mobile.BuildConfig
@@ -96,6 +102,9 @@ fun ProfileScreen(container: AppContainer) {
 
     val qualityPref = QualityPreference.entries.firstOrNull { it.key == settings.quality } ?: QualityPreference.AUTO
     val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
     Column(
         modifier = Modifier
@@ -416,11 +425,43 @@ fun ProfileScreen(container: AppContainer) {
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("息屏 / 后台继续听剧", color = TextPrimary, fontSize = 15.sp)
-                    Text("锁屏或切到后台时保持声音播放不自动暂停", color = TextSecondary, fontSize = 12.sp)
+                    Text("锁屏或切到后台时保活播放，支持通知栏与蓝牙线控", color = TextSecondary, fontSize = 12.sp)
                 }
                 Switch(
                     checked = settings.backgroundAudioPlay,
-                    onCheckedChange = { checked -> container.localStore.updateSettings { it.copy(backgroundAudioPlay = checked) } },
+                    onCheckedChange = { checked ->
+                        container.localStore.updateSettings { it.copy(backgroundAudioPlay = checked) }
+                        if (checked && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            val granted = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.POST_NOTIFICATIONS
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (!granted) {
+                                notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        }
+                    },
+                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = CoralRed)
+                )
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("启动时自动续播未看完剧集", color = TextPrimary, fontSize = 15.sp)
+                    Text("全集页看到第 2 集及以上中途退出，7 天内重新打开自动续播", color = TextSecondary, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = settings.autoResumeOnLaunch,
+                    onCheckedChange = { checked ->
+                        container.localStore.updateSettings { it.copy(autoResumeOnLaunch = checked) }
+                        if (!checked) {
+                            container.localStore.clearResumePlayback()
+                        }
+                    },
                     colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = CoralRed)
                 )
             }

@@ -2,6 +2,8 @@
 package io.github.hongguo.mobile.player
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -37,11 +39,20 @@ class ExoPlayerPool(private val maxPoolSize: Int = 3) {
     }
 
     fun release(player: ExoPlayer) {
-        player.playWhenReady = false
-        player.stop()
-        player.clearMediaItems()
-        player.clearVideoSurface()
-        player.playbackParameters = PlaybackParameters.DEFAULT
+        val resetOk = runCatching {
+            player.playWhenReady = false
+            player.stop()
+            player.clearMediaItems()
+            player.clearVideoSurface()
+            player.playbackParameters = PlaybackParameters.DEFAULT
+            player.volume = 1f
+            player.repeatMode = Player.REPEAT_MODE_OFF
+        }.isSuccess
+
+        if (!resetOk) {
+            runCatching { player.release() }
+            return
+        }
 
         val shouldRelease = synchronized(available) {
             if (available.size < maxPoolSize) {
@@ -52,7 +63,21 @@ class ExoPlayerPool(private val maxPoolSize: Int = 3) {
             }
         }
         if (shouldRelease) {
-            player.release()
+            runCatching { player.release() }
+        }
+    }
+
+    fun clear() {
+        val toRelease = synchronized(available) {
+            available.toList().also { available.clear() }
+        }
+        if (toRelease.isEmpty()) return
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            toRelease.forEach { runCatching { it.release() } }
+        } else {
+            Handler(Looper.getMainLooper()).post {
+                toRelease.forEach { runCatching { it.release() } }
+            }
         }
     }
 }

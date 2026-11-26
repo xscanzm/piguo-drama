@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
@@ -64,11 +65,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
@@ -93,8 +96,10 @@ import coil.compose.AsyncImage
 import io.github.hongguo.mobile.core.FullscreenButtonAnchor
 import io.github.hongguo.mobile.core.computeFullscreenButtonPlacement
 import io.github.hongguo.mobile.core.computeVideoViewportSize
+import io.github.hongguo.mobile.core.friendlyPlaybackError
 import io.github.hongguo.mobile.player.ExoPlayerPool
 import io.github.hongguo.mobile.player.MediaCacheManager
+import io.github.hongguo.mobile.player.PlaybackRemoteCommand
 import io.github.hongguo.mobile.player.ResolvedMediaSource
 import io.github.hongguo.mobile.ui.theme.CoralRed
 import kotlinx.coroutines.delay
@@ -133,10 +138,16 @@ fun VerticalDramaPlayer(
     showFullscreenHint: Boolean = true,
     topSafeClearanceDp: Dp = 64.dp,
     bottomOverlayClearanceDp: Dp = 240.dp,
+    replayTrigger: Int = 0,
+    canAutoRecover: Boolean = false,
+    onAutoRecover: (() -> Unit)? = null,
+    onPlaybackPlayingChange: (Boolean) -> Unit = {},
+    remoteCommandTrigger: Pair<Int, PlaybackRemoteCommand>? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val haptic = LocalHapticFeedback.current
     val audioManager = remember(context) {
         context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
@@ -144,11 +155,15 @@ fun VerticalDramaPlayer(
     var isPlaying by remember { mutableStateOf(false) }
     var isUserPaused by remember { mutableStateOf(false) }
     var isBuffering by remember { mutableStateOf(false) }
+    var showMidBuffering by remember { mutableStateOf(false) }
     var isLongPressing by remember { mutableStateOf(false) }
     var isScreenLocked by remember(isFullscreen) { mutableStateOf(false) }
     var lockHintVisible by remember(isFullscreen) { mutableStateOf(false) }
+    var fullscreenHudVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var fullscreenHudPulse by remember { mutableIntStateOf(0) }
     var playerError by remember { mutableStateOf<String?>(null) }
     var currentPosMs by remember { mutableLongStateOf(0L) }
+    var bufferedPosMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(0L) }
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableFloatStateOf(0f) }
@@ -162,12 +177,18 @@ fun VerticalDramaPlayer(
     var lastHandledSleepTrigger by remember { mutableIntStateOf(sleepTriggerCount) }
 
     val latestMediaSource by rememberUpdatedState(mediaSource)
+    val latestIsActive by rememberUpdatedState(isActive)
+    val latestIsUserPaused by rememberUpdatedState(isUserPaused)
+    val latestPlayerError by rememberUpdatedState(playerError)
     val latestFlushProgress by rememberUpdatedState(onFlushProgress)
     val latestBackgroundAudio by rememberUpdatedState(backgroundAudioPlay)
     val latestInPip by rememberUpdatedState(isInPipMode)
     val latestOnVideoAspect by rememberUpdatedState(onVideoAspectKnown)
     val latestOnEnded by rememberUpdatedState(onEnded)
     val latestOnProgressUpdate by rememberUpdatedState(onProgressUpdate)
+    val latestCanAutoRecover by rememberUpdatedState(canAutoRecover)
+    val latestOnAutoRecover by rememberUpdatedState(onAutoRecover)
+    val latestOnPlaybackPlayingChange by rememberUpdatedState(onPlaybackPlayingChange)
 
     LaunchedEffect(lockHintVisible, isScreenLocked) {
         if (lockHintVisible && isScreenLocked) {
@@ -176,15 +197,74 @@ fun VerticalDramaPlayer(
         }
     }
 
+    LaunchedEffect(
+        isFullscreen,
+        fullscreenHudVisible,
+        isPlaying,
+        isUserPaused,
+        isScrubbing,
+        isScreenLocked,
+        fullscreenHudPulse
+    ) {
+        if (isFullscreen && fullscreenHudVisible && isPlaying && !isUserPaused && !isScrubbing && !isScreenLocked) {
+            delay(3500L)
+            fullscreenHudVisible = false
+        }
+    }
+
+    LaunchedEffect(mediaSource, isBuffering, isUserPaused, playerError, firstFrameRendered) {
+        if (mediaSource != null && isBuffering && !isUserPaused && playerError == null && firstFrameRendered) {
+            delay(300L)
+            showMidBuffering = true
+        } else {
+            showMidBuffering = false
+        }
+    }
+
     val activeSource = remember(mediaSource, fallbackIndex) {
         if (mediaSource == null) null
         else if (fallbackIndex == 0) mediaSource
         else mediaSource.fallbackSources.getOrNull(fallbackIndex - 1)
     }
+    val latestActiveSource by rememberUpdatedState(activeSource)
 
     val isLandscapeVideo = (videoWidth * videoPixelRatio) > videoHeight && videoHeight > 0
 
     val exoPlayer = remember(context) { playerPool.acquire(context) }
+
+    LaunchedEffect(replayTrigger) {
+        if (replayTrigger > 0 && activeSource != null) {
+            playerError = null
+            isUserPaused = false
+            exoPlayer.seekTo(0L)
+            currentPosMs = 0L
+            exoPlayer.playWhenReady = isActive
+            if (isActive) exoPlayer.play()
+        }
+    }
+
+    LaunchedEffect(remoteCommandTrigger) {
+        val cmd = remoteCommandTrigger?.second ?: return@LaunchedEffect
+        if (!isActive || activeSource == null || playerError != null) return@LaunchedEffect
+        when (cmd) {
+            PlaybackRemoteCommand.PLAY -> {
+                isUserPaused = false
+                exoPlayer.playWhenReady = true
+                exoPlayer.play()
+            }
+            PlaybackRemoteCommand.PAUSE, PlaybackRemoteCommand.STOP -> {
+                isUserPaused = true
+                exoPlayer.playWhenReady = false
+                latestFlushProgress()
+            }
+            PlaybackRemoteCommand.TOGGLE_PLAY_PAUSE -> {
+                isUserPaused = !isUserPaused
+                exoPlayer.playWhenReady = !isUserPaused
+                if (isUserPaused) latestFlushProgress() else exoPlayer.play()
+            }
+            PlaybackRemoteCommand.NEXT_EPISODE -> Unit
+        }
+    }
 
     LaunchedEffect(sleepTriggerCount) {
         if (sleepTriggerCount > lastHandledSleepTrigger) {
@@ -214,6 +294,7 @@ fun VerticalDramaPlayer(
         videoHeight = 0
         videoPixelRatio = 1f
         isUserPaused = false
+        bufferedPosMs = 0L
 
         val dataSourceFactory = mediaCache.createPlaybackDataSourceFactory(activeSource)
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
@@ -240,6 +321,7 @@ fun VerticalDramaPlayer(
         if (!isActive) {
             isLongPressing = false
             onLongPressSpeedChange(false)
+            latestOnPlaybackPlayingChange(false)
             latestFlushProgress()
         }
     }
@@ -253,6 +335,9 @@ fun VerticalDramaPlayer(
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
+                if (latestIsActive) {
+                    latestOnPlaybackPlayingChange(playing)
+                }
             }
 
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -293,13 +378,16 @@ fun VerticalDramaPlayer(
                 val maxFallbacks = latestMediaSource?.fallbackSources?.size ?: 0
                 if (fallbackIndex < maxFallbacks) {
                     fallbackIndex += 1
+                } else if (latestCanAutoRecover && latestOnAutoRecover != null) {
+                    latestOnAutoRecover?.invoke()
                 } else {
-                    playerError = "视频解码或播放异常 (${error.errorCodeName})"
+                    playerError = friendlyPlaybackError(error.errorCode, error.errorCodeName)
                 }
             }
         }
         exoPlayer.addListener(listener)
         onDispose {
+            latestOnPlaybackPlayingChange(false)
             latestFlushProgress()
             playerViewRef?.player = null
             exoPlayer.removeListener(listener)
@@ -319,8 +407,13 @@ fun VerticalDramaPlayer(
                         exoPlayer.pause()
                     }
                 }
-                Lifecycle.Event.ON_START, Lifecycle.Event.ON_RESUME -> {
-                    if (isActive && !isUserPaused && activeSource != null) {
+                Lifecycle.Event.ON_RESUME -> {
+                    if (latestIsActive &&
+                        !latestIsUserPaused &&
+                        latestActiveSource != null &&
+                        latestPlayerError == null &&
+                        exoPlayer.playbackState != Player.STATE_ENDED
+                    ) {
                         exoPlayer.play()
                     }
                 }
@@ -336,6 +429,7 @@ fun VerticalDramaPlayer(
         while (isActive && activeSource != null) {
             if (!isScrubbing) {
                 currentPosMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                bufferedPosMs = exoPlayer.bufferedPosition.coerceAtLeast(0L)
                 val dur = exoPlayer.duration
                 if (dur > 0L) durationMs = dur
                 if (++ticks % 4 == 0 && currentPosMs > 0L) {
@@ -347,7 +441,7 @@ fun VerticalDramaPlayer(
     }
 
     val controlsVisibleInFullscreen = !isInPipMode &&
-        (!isFullscreen || (!isScreenLocked && (isUserPaused || (!isPlaying && !isBuffering) || isScrubbing)))
+        (!isFullscreen || (!isScreenLocked && (fullscreenHudVisible || isUserPaused || (!isPlaying && !isBuffering) || isScrubbing)))
     LaunchedEffect(controlsVisibleInFullscreen, isFullscreen) {
         onControlsVisibilityChange(controlsVisibleInFullscreen)
     }
@@ -373,6 +467,12 @@ fun VerticalDramaPlayer(
                             lockHintVisible = !lockHintVisible
                             return@detectTapGestures
                         }
+                        if (isFullscreen) {
+                            fullscreenHudVisible = !fullscreenHudVisible
+                            if (fullscreenHudVisible) fullscreenHudPulse++
+                            onTapScreen()
+                            return@detectTapGestures
+                        }
                         if (mediaSource != null && playerError == null) {
                             isUserPaused = !isUserPaused
                             exoPlayer.playWhenReady = !isUserPaused
@@ -380,9 +480,21 @@ fun VerticalDramaPlayer(
                         }
                         onTapScreen()
                     },
+                    onDoubleTap = if (isFullscreen) {
+                        {
+                            if (!isInPipMode && !isScreenLocked && mediaSource != null && playerError == null) {
+                                isUserPaused = !isUserPaused
+                                exoPlayer.playWhenReady = !isUserPaused
+                                if (isUserPaused) latestFlushProgress()
+                                fullscreenHudVisible = true
+                                fullscreenHudPulse++
+                            }
+                        }
+                    } else null,
                     onLongPress = {
                         if (isFullscreen && isScreenLocked) return@detectTapGestures
                         if (mediaSource != null && isActive) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             isLongPressing = true
                             onLongPressSpeedChange(true)
                         }
@@ -459,6 +571,61 @@ fun VerticalDramaPlayer(
                     if (view.keepScreenOn != shouldKeepScreenOn) view.keepScreenOn = shouldKeepScreenOn
                 },
                 modifier = playerViewModifier
+            )
+        }
+
+        // Portrait horizontal drag-to-seek gesture (never blocks vertical pager or bottom seekbar)
+        if (!isFullscreen && !isScreenLocked && !isInPipMode && mediaSource != null && playerError == null && durationMs > 0L) {
+            val portraitBottomSeekZonePx = with(density) { 44.dp.toPx() }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(isFullscreen, mediaSource, boxWpx, boxHpx) {
+                        var totalDx = 0f
+                        var seekBaseMs = 0L
+                        var seekTargetMs = 0L
+                        var ignoreDrag = false
+
+                        detectHorizontalDragGestures(
+                            onDragStart = { startOffset ->
+                                ignoreDrag = startOffset.y > (boxHpx - portraitBottomSeekZonePx)
+                                totalDx = 0f
+                                if (!ignoreDrag) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    seekBaseMs = latestCurrentPosMs
+                                    seekTargetMs = seekBaseMs
+                                }
+                            },
+                            onHorizontalDrag = { change, dragAmount ->
+                                if (ignoreDrag) return@detectHorizontalDragGestures
+                                change.consume()
+                                totalDx += dragAmount
+                                val dur = latestDurationMs.coerceAtLeast(1L)
+                                val spanMs = minOf(dur.coerceAtLeast(15_000L), 90_000L)
+                                val deltaMs = ((totalDx / boxWpx) * spanMs).toLong()
+                                seekTargetMs = (seekBaseMs + deltaMs).coerceIn(0L, dur)
+                                isScrubbing = true
+                                scrubFraction = (seekTargetMs.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                                val sign = if (seekTargetMs >= seekBaseMs) "+" else "-"
+                                val diffSec = abs(seekTargetMs - seekBaseMs) / 1000L
+                                gestureHudText = "${formatDuration(seekTargetMs)} / ${formatDuration(dur)} ($sign${diffSec}s)"
+                            },
+                            onDragEnd = {
+                                if (!ignoreDrag) {
+                                    exoPlayer.seekTo(seekTargetMs)
+                                    currentPosMs = seekTargetMs
+                                    isScrubbing = false
+                                }
+                                gestureHudText = null
+                            },
+                            onDragCancel = {
+                                if (!ignoreDrag) {
+                                    isScrubbing = false
+                                }
+                                gestureHudText = null
+                            }
+                        )
+                    }
             )
         }
 
@@ -580,7 +747,7 @@ fun VerticalDramaPlayer(
             )
         }
 
-        if (isLoading || (mediaSource != null && isBuffering && !firstFrameRendered && playerError == null)) {
+        if (isLoading || (mediaSource != null && isBuffering && !firstFrameRendered && playerError == null) || showMidBuffering) {
             CircularProgressIndicator(
                 color = CoralRed,
                 strokeWidth = 3.dp,
@@ -590,24 +757,55 @@ fun VerticalDramaPlayer(
             )
         }
 
-        AnimatedVisibility(
-            visible = !isInPipMode && isUserPaused && !isLoading && playerError == null && mediaSource != null,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.Center)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(64.dp)
-                    .background(Color.Black.copy(alpha = 0.45f), CircleShape),
-                contentAlignment = Alignment.Center
+        if (isFullscreen) {
+            AnimatedVisibility(
+                visible = !isInPipMode && !isScreenLocked && controlsVisibleInFullscreen && !isLoading && playerError == null && mediaSource != null,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.Center)
             ) {
-                Icon(
-                    imageVector = Icons.Default.PlayArrow,
-                    contentDescription = "播放",
-                    tint = Color.White.copy(alpha = 0.92f),
-                    modifier = Modifier.size(42.dp)
-                )
+                val showPlay = isUserPaused || !isPlaying
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.48f))
+                        .clickable {
+                            isUserPaused = !showPlay
+                            exoPlayer.playWhenReady = showPlay
+                            if (!showPlay) latestFlushProgress()
+                            fullscreenHudPulse++
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (showPlay) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        contentDescription = if (showPlay) "播放" else "暂停",
+                        tint = Color.White.copy(alpha = 0.94f),
+                        modifier = Modifier.size(38.dp)
+                    )
+                }
+            }
+        } else {
+            AnimatedVisibility(
+                visible = !isInPipMode && isUserPaused && !isLoading && playerError == null && mediaSource != null,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.Center)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(Color.Black.copy(alpha = 0.45f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "播放",
+                        tint = Color.White.copy(alpha = 0.92f),
+                        modifier = Modifier.size(42.dp)
+                    )
+                }
             }
         }
 
@@ -683,9 +881,12 @@ fun VerticalDramaPlayer(
         if (showLockBtn) {
             IconButton(
                 onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     if (isScreenLocked) {
                         isScreenLocked = false
                         lockHintVisible = false
+                        fullscreenHudVisible = true
+                        fullscreenHudPulse++
                     } else {
                         isScreenLocked = true
                         lockHintVisible = true
@@ -788,14 +989,18 @@ fun VerticalDramaPlayer(
         val shouldShowSeekBar = !isInPipMode && showSeekBar && durationMs > 0L && controlsVisibleInFullscreen
         if (shouldShowSeekBar) {
             val fraction = if (isScrubbing) scrubFraction else (currentPosMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+            val bufferedFraction = (bufferedPosMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
             ThinVideoProgressBar(
                 fraction = fraction,
+                bufferedFraction = bufferedFraction,
                 isScrubbing = isScrubbing,
                 currentMs = if (isScrubbing) (scrubFraction * durationMs).toLong() else currentPosMs,
                 durationMs = durationMs,
                 onScrubStart = { f ->
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     isScrubbing = true
                     scrubFraction = f
+                    fullscreenHudPulse++
                 },
                 onScrubChange = { f ->
                     scrubFraction = f
@@ -805,6 +1010,7 @@ fun VerticalDramaPlayer(
                     exoPlayer.seekTo(targetMs)
                     currentPosMs = targetMs
                     isScrubbing = false
+                    fullscreenHudPulse++
                 },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -818,6 +1024,7 @@ fun VerticalDramaPlayer(
 @Composable
 private fun ThinVideoProgressBar(
     fraction: Float,
+    bufferedFraction: Float,
     isScrubbing: Boolean,
     currentMs: Long,
     durationMs: Long,
@@ -829,6 +1036,9 @@ private fun ThinVideoProgressBar(
     var widthPx by remember { mutableIntStateOf(1) }
     var dragFraction by remember { mutableFloatStateOf(fraction) }
     val density = LocalDensity.current
+    val latestOnScrubStart by rememberUpdatedState(onScrubStart)
+    val latestOnScrubChange by rememberUpdatedState(onScrubChange)
+    val latestOnScrubEnd by rememberUpdatedState(onScrubEnd)
 
     Column(modifier = modifier) {
         if (isScrubbing) {
@@ -845,7 +1055,7 @@ private fun ThinVideoProgressBar(
             Spacer(Modifier.height(8.dp))
         }
 
-        val trackHeight = if (isScrubbing) 4.dp else 2.dp
+        val trackHeight = if (isScrubbing) 4.5.dp else 2.5.dp
         val thumbSize = if (isScrubbing) 12.dp else 6.dp
         val thumbHalfPx = with(density) { (thumbSize / 2).toPx() }
 
@@ -853,27 +1063,27 @@ private fun ThinVideoProgressBar(
             contentAlignment = Alignment.CenterStart,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(22.dp)
+                .height(30.dp)
                 .onSizeChanged { widthPx = it.width.coerceAtLeast(1) }
-                .pointerInput(durationMs) {
+                .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         val f = (offset.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                        onScrubEnd(f)
+                        latestOnScrubEnd(f)
                     }
                 }
-                .pointerInput(durationMs) {
+                .pointerInput(Unit) {
                     detectHorizontalDragGestures(
                         onDragStart = { offset ->
                             dragFraction = (offset.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                            onScrubStart(dragFraction)
+                            latestOnScrubStart(dragFraction)
                         },
                         onHorizontalDrag = { change, _ ->
                             change.consume()
                             dragFraction = (change.position.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                            onScrubChange(dragFraction)
+                            latestOnScrubChange(dragFraction)
                         },
-                        onDragEnd = { onScrubEnd(dragFraction) },
-                        onDragCancel = { onScrubEnd(dragFraction) }
+                        onDragEnd = { latestOnScrubEnd(dragFraction) },
+                        onDragCancel = { latestOnScrubEnd(dragFraction) }
                     )
                 }
         ) {
@@ -884,6 +1094,12 @@ private fun ThinVideoProgressBar(
                     .clip(RoundedCornerShape(trackHeight))
                     .background(Color.White.copy(alpha = 0.25f))
             ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(bufferedFraction.coerceIn(0f, 1f))
+                        .height(trackHeight)
+                        .background(Color.White.copy(alpha = 0.42f))
+                )
                 Box(
                     modifier = Modifier
                         .fillMaxWidth(fraction.coerceIn(0f, 1f))
