@@ -106,6 +106,16 @@ private data class EpisodeLoadState(
     val error: String? = null
 )
 
+internal fun shouldHoldFullSeriesControlsVisible(
+    autoCleanEnabled: Boolean,
+    isUserPaused: Boolean,
+    anySheetOpen: Boolean,
+    isFullscreen: Boolean,
+    hasLoadError: Boolean
+): Boolean {
+    return !autoCleanEnabled || isUserPaused || anySheetOpen || isFullscreen || hasLoadError
+}
+
 @Composable
 fun DramaSeriesPlayerScreen(
     container: AppContainer,
@@ -211,8 +221,6 @@ fun DramaSeriesPlayerScreen(
     var isCurEpUserPaused by remember(loadedDetail.seriesId) { mutableStateOf(false) }
     var autoCleanHidden by remember(loadedDetail.seriesId) { mutableStateOf(false) }
     var isInitialAutoCleanPending by remember(loadedDetail.seriesId) { mutableStateOf(true) }
-    var hasInitializedPage by remember(loadedDetail.seriesId) { mutableStateOf(false) }
-    var episodeToastText by remember(loadedDetail.seriesId) { mutableStateOf<String?>(null) }
     var remoteCmdSeq by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
     var remoteCommandTrigger by remember(loadedDetail.seriesId) { mutableStateOf<Pair<Int, PlaybackRemoteCommand>?>(null) }
     val initialSleepTrigger = remember { sleepState.triggerCount }
@@ -239,13 +247,6 @@ fun DramaSeriesPlayerScreen(
         }
     }
 
-    LaunchedEffect(episodeToastText) {
-        if (!episodeToastText.isNullOrBlank()) {
-            delay(2_000L)
-            episodeToastText = null
-        }
-    }
-
     var cleanMode by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
     var fullscreenControlsVisible by remember(isFullscreen) { mutableStateOf(true) }
@@ -262,18 +263,18 @@ fun DramaSeriesPlayerScreen(
     val curEpForClean = loadedDetail.episodes.getOrNull(pagerState.currentPage)
     val curEpLoadState = curEpForClean?.let { episodeStates[it.vid] }
     val anySheetOpen = showEpisodeSheet || showDetailSheet || showSpeedSheet || showQualitySheet || showSeriesEndedCard
-    val holdControlsVisible = !settings.autoCleanFullSeriesPlayer ||
-        isCurEpUserPaused ||
-        anySheetOpen ||
-        isFullscreen ||
-        curEpLoadState?.media == null ||
-        curEpLoadState.error != null ||
-        curEpLoadState.loading
+    val holdControlsVisible = shouldHoldFullSeriesControlsVisible(
+        autoCleanEnabled = settings.autoCleanFullSeriesPlayer,
+        isUserPaused = isCurEpUserPaused,
+        anySheetOpen = anySheetOpen,
+        isFullscreen = isFullscreen,
+        hasLoadError = curEpLoadState?.error != null
+    )
 
-    LaunchedEffect(settings.autoCleanFullSeriesPlayer, holdControlsVisible, isCurEpPlaying) {
+    LaunchedEffect(settings.autoCleanFullSeriesPlayer, holdControlsVisible, isCurEpPlaying, autoCleanHidden) {
         if (!settings.autoCleanFullSeriesPlayer || holdControlsVisible) {
             autoCleanHidden = false
-        } else if (isCurEpPlaying) {
+        } else if (isCurEpPlaying && !autoCleanHidden) {
             val waitMs = if (isInitialAutoCleanPending) 3_000L else 900L
             delay(waitMs)
             isInitialAutoCleanPending = false
@@ -398,13 +399,6 @@ fun DramaSeriesPlayerScreen(
     // Resolve current episode & preload next 1-2 episodes
     LaunchedEffect(pagerState.currentPage, loadedDetail, effectiveQuality, mediaRetryTick) {
         showSeriesEndedCard = false
-        if (hasInitializedPage) {
-            if (effectiveCleanMode && !isFullscreen && !inPip) {
-                episodeToastText = "第 ${pagerState.currentPage + 1} / ${loadedDetail.episodes.size} 集"
-            }
-        } else {
-            hasInitializedPage = true
-        }
         if (pagerState.currentPage >= (loadedDetail.episodes.size - 2).coerceAtLeast(0) &&
             relatedBundle == null &&
             !relatedLoading
@@ -882,7 +876,7 @@ fun DramaSeriesPlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = (showAutoResumeBanner || showSleepEndedHint || !episodeToastText.isNullOrBlank()) && !inPip,
+            visible = (showAutoResumeBanner || showSleepEndedHint) && !inPip,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
@@ -924,13 +918,6 @@ fun DramaSeriesPlayerScreen(
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
-                    )
-                } else if (!episodeToastText.isNullOrBlank()) {
-                    Text(
-                        text = episodeToastText.orEmpty(),
-                        color = Color.White.copy(alpha = 0.92f),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }

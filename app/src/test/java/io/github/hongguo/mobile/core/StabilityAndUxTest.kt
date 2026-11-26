@@ -4,6 +4,7 @@ package io.github.hongguo.mobile.core
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
 import io.github.hongguo.mobile.ui.components.shouldShowFullscreenControls
+import io.github.hongguo.mobile.ui.screens.shouldHoldFullSeriesControlsVisible
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -364,6 +365,64 @@ class StabilityAndUxTest {
                 isUserPaused = false,
                 isScrubbing = false,
                 hasError = false
+            )
+        )
+    }
+
+    @Test
+    fun portraitAutoCleanStaysHiddenAcrossEpisodeLoadingTransition() {
+        assertFalse(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = true,
+                isUserPaused = false,
+                anySheetOpen = false,
+                isFullscreen = false,
+                hasLoadError = false
+            )
+        )
+        assertTrue(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = false,
+                isUserPaused = false,
+                anySheetOpen = false,
+                isFullscreen = false,
+                hasLoadError = false
+            )
+        )
+        assertTrue(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = true,
+                isUserPaused = true,
+                anySheetOpen = false,
+                isFullscreen = false,
+                hasLoadError = false
+            )
+        )
+        assertTrue(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = true,
+                isUserPaused = false,
+                anySheetOpen = true,
+                isFullscreen = false,
+                hasLoadError = false
+            )
+        )
+        assertTrue(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = true,
+                isUserPaused = false,
+                anySheetOpen = false,
+                isFullscreen = true,
+                hasLoadError = false
+            )
+        )
+        assertTrue(
+            shouldHoldFullSeriesControlsVisible(
+                autoCleanEnabled = true,
+                isUserPaused = false,
+                anySheetOpen = false,
+                isFullscreen = false,
+                hasLoadError = true
             )
         )
     }
