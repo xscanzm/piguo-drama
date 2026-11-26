@@ -194,7 +194,8 @@ data class UserSettings(
     val fitModeFill: Boolean = false,
     val fitModeUserChosen: Boolean = false,
     val backgroundAudioPlay: Boolean = false,
-    val autoResumeOnLaunch: Boolean = true
+    val autoResumeOnLaunch: Boolean = true,
+    val autoCleanFullSeriesPlayer: Boolean = true
 )
 
 @Serializable

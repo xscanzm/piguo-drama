@@ -213,7 +213,9 @@ fun HomeFeedScreen(
     var curVideoH by remember { mutableIntStateOf(0) }
     var cleanMode by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
-    var fullscreenControlsVisible by remember { mutableStateOf(true) }
+    var fullscreenControlsVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var fullscreenHudVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var isFullscreenLocked by remember(isFullscreen) { mutableStateOf(false) }
     var longPressActive by remember { mutableStateOf(false) }
     var showEpisodeSheetFor by remember { mutableStateOf<DramaDetail?>(null) }
     var showDetailSheetFor by remember { mutableStateOf<DramaSummary?>(null) }
@@ -843,6 +845,10 @@ fun HomeFeedScreen(
                         onControlsVisibilityChange = { vis ->
                             if (isPageActive) fullscreenControlsVisible = vis
                         },
+                        fullscreenHudVisible = fullscreenHudVisible,
+                        onFullscreenHudVisibleChange = { fullscreenHudVisible = it },
+                        isFullscreenLocked = isFullscreenLocked,
+                        onFullscreenLockedChange = { isFullscreenLocked = it },
                         onVideoAspectKnown = { w, h ->
                             if (isPageActive) {
                                 curVideoW = w
@@ -854,6 +860,19 @@ fun HomeFeedScreen(
                             if (isPageActive) isCurFeedPlaying = playing
                         },
                         remoteCommandTrigger = if (isPageActive) remoteCommandTrigger else null,
+                        canDowngradeQuality = effectiveQuality != QualityPreference.P480 && effectiveQuality != QualityPreference.P360,
+                        onQuickDowngradeQuality = {
+                            val pos = livePositions[drama.seriesId] ?: 0L
+                            qualityResumeBySeries = drama.seriesId to pos
+                            container.localStore.updateSettings { it.copy(quality = QualityPreference.P480.key) }
+                            val keys = episodeStates.keys.toList()
+                            for (k in keys) {
+                                episodeStates[k]?.let { st ->
+                                    episodeStates[k] = st.copy(media = null, loading = false, error = null)
+                                }
+                            }
+                            retryTick++
+                        },
                         showSeekBar = !cleanMode,
                         showFullscreenHint = !cleanMode
                     )

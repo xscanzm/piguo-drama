@@ -7,6 +7,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -57,6 +59,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -67,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import coil.compose.AsyncImage
 import io.github.hongguo.mobile.AppContainer
 import io.github.hongguo.mobile.core.DramaDetail
 import io.github.hongguo.mobile.core.DramaSummary
@@ -75,7 +79,9 @@ import io.github.hongguo.mobile.core.RelatedDramaBundle
 import io.github.hongguo.mobile.core.ResumePlaybackState
 import io.github.hongguo.mobile.core.SeriesSeasonMatcher
 import io.github.hongguo.mobile.core.friendlyErrorMessage
+import io.github.hongguo.mobile.core.isHistoryCompleted
 import io.github.hongguo.mobile.core.isSeriesCompleted
+import io.github.hongguo.mobile.core.resolveSeriesEndSuggestion
 import io.github.hongguo.mobile.core.shouldRecordWatchHistory
 import io.github.hongguo.mobile.player.ActivePlaybackMeta
 import io.github.hongguo.mobile.player.PlaybackRemoteCommand
@@ -202,10 +208,16 @@ fun DramaSeriesPlayerScreen(
     var showAutoResumeBanner by remember(loadedDetail.seriesId, autoResumed) { mutableStateOf(autoResumed) }
     val busOwnerId = remember(loadedDetail.seriesId) { "series_${loadedDetail.seriesId}_${System.nanoTime()}" }
     var isCurEpPlaying by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var isCurEpUserPaused by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var autoCleanHidden by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var isInitialAutoCleanPending by remember(loadedDetail.seriesId) { mutableStateOf(true) }
+    var hasInitializedPage by remember(loadedDetail.seriesId) { mutableStateOf(false) }
+    var episodeToastText by remember(loadedDetail.seriesId) { mutableStateOf<String?>(null) }
     var remoteCmdSeq by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
     var remoteCommandTrigger by remember(loadedDetail.seriesId) { mutableStateOf<Pair<Int, PlaybackRemoteCommand>?>(null) }
     val initialSleepTrigger = remember { sleepState.triggerCount }
     var showSleepEndedHint by remember { mutableStateOf(false) }
+    val feedPrefs by container.localStore.feedPreferences.collectAsState()
 
     fun exitExplicitly() {
         container.localStore.clearResumePlayback()
@@ -226,9 +238,19 @@ fun DramaSeriesPlayerScreen(
             showSleepEndedHint = false
         }
     }
+
+    LaunchedEffect(episodeToastText) {
+        if (!episodeToastText.isNullOrBlank()) {
+            delay(2_000L)
+            episodeToastText = null
+        }
+    }
+
     var cleanMode by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
-    var fullscreenControlsVisible by remember { mutableStateOf(true) }
+    var fullscreenControlsVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var fullscreenHudVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var isFullscreenLocked by remember(isFullscreen) { mutableStateOf(false) }
     var longPressActive by remember { mutableStateOf(false) }
     var curVideoW by remember { mutableIntStateOf(0) }
     var curVideoH by remember { mutableIntStateOf(0) }
@@ -236,6 +258,30 @@ fun DramaSeriesPlayerScreen(
     var showDetailSheet by remember { mutableStateOf(false) }
     var showSpeedSheet by remember { mutableStateOf(false) }
     var showQualitySheet by remember { mutableStateOf(false) }
+
+    val curEpForClean = loadedDetail.episodes.getOrNull(pagerState.currentPage)
+    val curEpLoadState = curEpForClean?.let { episodeStates[it.vid] }
+    val anySheetOpen = showEpisodeSheet || showDetailSheet || showSpeedSheet || showQualitySheet || showSeriesEndedCard
+    val holdControlsVisible = !settings.autoCleanFullSeriesPlayer ||
+        isCurEpUserPaused ||
+        anySheetOpen ||
+        isFullscreen ||
+        curEpLoadState?.media == null ||
+        curEpLoadState.error != null ||
+        curEpLoadState.loading
+
+    LaunchedEffect(settings.autoCleanFullSeriesPlayer, holdControlsVisible, isCurEpPlaying) {
+        if (!settings.autoCleanFullSeriesPlayer || holdControlsVisible) {
+            autoCleanHidden = false
+        } else if (isCurEpPlaying) {
+            val waitMs = if (isInitialAutoCleanPending) 3_000L else 900L
+            delay(waitMs)
+            isInitialAutoCleanPending = false
+            autoCleanHidden = true
+        }
+    }
+
+    val effectiveCleanMode = if (settings.autoCleanFullSeriesPlayer) autoCleanHidden else cleanMode
     var usedInitialPos by remember { mutableStateOf(false) }
     var topBarHeightPx by remember { mutableIntStateOf(0) }
     var relatedBundle by remember(loadedDetail.seriesId) { mutableStateOf<RelatedDramaBundle?>(null) }
@@ -352,6 +398,24 @@ fun DramaSeriesPlayerScreen(
     // Resolve current episode & preload next 1-2 episodes
     LaunchedEffect(pagerState.currentPage, loadedDetail, effectiveQuality, mediaRetryTick) {
         showSeriesEndedCard = false
+        if (hasInitializedPage) {
+            if (effectiveCleanMode && !isFullscreen && !inPip) {
+                episodeToastText = "第 ${pagerState.currentPage + 1} / ${loadedDetail.episodes.size} 集"
+            }
+        } else {
+            hasInitializedPage = true
+        }
+        if (pagerState.currentPage >= (loadedDetail.episodes.size - 2).coerceAtLeast(0) &&
+            relatedBundle == null &&
+            !relatedLoading
+        ) {
+            scope.launch {
+                runCatching {
+                    val fetched = container.apiClient.fetchRelatedDramas(currentSummary)
+                    if (relatedBundle == null) relatedBundle = fetched
+                }
+            }
+        }
         if (episodeStates.size > 35) {
             val keepStart = (pagerState.currentPage - 15).coerceAtLeast(0)
             val keepEnd = (pagerState.currentPage + 15).coerceAtMost(loadedDetail.episodes.lastIndex)
@@ -442,11 +506,11 @@ fun DramaSeriesPlayerScreen(
             }
             var bottomContentHeightPx by remember { mutableIntStateOf(0) }
             val measuredTopClearanceDp = with(density) { topBarHeightPx.toDp() }
-            val effectiveTopClearanceDp = if (!cleanMode && measuredTopClearanceDp > 0.dp) {
+            val effectiveTopClearanceDp = if (!effectiveCleanMode && measuredTopClearanceDp > 0.dp) {
                 measuredTopClearanceDp + 6.dp
             } else 44.dp
             val measuredBottomClearanceDp = with(density) { bottomContentHeightPx.toDp() }
-            val effectiveBottomClearanceDp = if (!cleanMode && measuredBottomClearanceDp > 0.dp) {
+            val effectiveBottomClearanceDp = if (!effectiveCleanMode && measuredBottomClearanceDp > 0.dp) {
                 measuredBottomClearanceDp + 8.dp
             } else 44.dp
 
@@ -486,6 +550,7 @@ fun DramaSeriesPlayerScreen(
                     },
                     onEnded = {
                         if (container.sleepTimer.consumeEpisodeEndTrigger()) return@VerticalDramaPlayer
+                        val isBackgroundOrPip = inPip || !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
                         if (settings.autoPlayNext && page + 1 < loadedDetail.episodes.size) {
                             scope.launch {
                                 if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
@@ -496,7 +561,12 @@ fun DramaSeriesPlayerScreen(
                             }
                         } else if (page + 1 >= loadedDetail.episodes.size && isActive) {
                             container.localStore.clearResumePlayback()
-                            showSeriesEndedCard = true
+                            if (!isBackgroundOrPip) {
+                                if (relatedBundle == null && !relatedLoading) {
+                                    relatedReloadTick++
+                                }
+                                showSeriesEndedCard = true
+                            }
                         }
                     },
                     onProgressUpdate = { pos, dur ->
@@ -547,6 +617,10 @@ fun DramaSeriesPlayerScreen(
                     onControlsVisibilityChange = { vis ->
                         if (isActive) fullscreenControlsVisible = vis
                     },
+                    fullscreenHudVisible = fullscreenHudVisible,
+                    onFullscreenHudVisibleChange = { fullscreenHudVisible = it },
+                    isFullscreenLocked = isFullscreenLocked,
+                    onFullscreenLockedChange = { isFullscreenLocked = it },
                     onVideoAspectKnown = { w, h ->
                         if (isActive) {
                             curVideoW = w
@@ -561,12 +635,23 @@ fun DramaSeriesPlayerScreen(
                         if (isActive) isCurEpPlaying = playing
                     },
                     remoteCommandTrigger = if (isActive) remoteCommandTrigger else null,
-                    showSeekBar = !cleanMode,
-                    showFullscreenHint = !cleanMode,
+                    onUserPausedChange = { paused ->
+                        if (isActive) isCurEpUserPaused = paused
+                    },
+                    canDowngradeQuality = effectiveQuality != QualityPreference.P480 && effectiveQuality != QualityPreference.P360,
+                    onQuickDowngradeQuality = {
+                        val savedPos = livePositions[ep.index] ?: 0L
+                        qualityResumePos = pagerState.currentPage to savedPos
+                        container.localStore.updateSettings { it.copy(quality = QualityPreference.P480.key) }
+                        episodeStates.clear()
+                        mediaRetryTick++
+                    },
+                    showSeekBar = !effectiveCleanMode,
+                    showFullscreenHint = !effectiveCleanMode,
                     modifier = if (isFullscreen || inPip) Modifier else Modifier.navigationBarsPadding()
                 )
 
-                if (!cleanMode && !isFullscreen && !inPip) {
+                if (!effectiveCleanMode && !isFullscreen && !inPip) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -582,7 +667,7 @@ fun DramaSeriesPlayerScreen(
 
                 // Right action rail
                 AnimatedVisibility(
-                    visible = !cleanMode && !longPressActive && !isFullscreen && !inPip,
+                    visible = !effectiveCleanMode && !longPressActive && !isFullscreen && !inPip,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier
@@ -620,15 +705,17 @@ fun DramaSeriesPlayerScreen(
                             label = "${settings.playbackSpeed}x",
                             onClick = { showSpeedSheet = true }
                         )
-                        FeedActionIcon(
-                            icon = Icons.Default.VisibilityOff,
-                            label = "清屏",
-                            onClick = { cleanMode = true }
-                        )
+                        if (!settings.autoCleanFullSeriesPlayer) {
+                            FeedActionIcon(
+                                icon = Icons.Default.VisibilityOff,
+                                label = "清屏",
+                                onClick = { cleanMode = true }
+                            )
+                        }
                     }
                 }
 
-                if (cleanMode && !inPip) {
+                if (!settings.autoCleanFullSeriesPlayer && cleanMode && !inPip) {
                     IconButton(
                         onClick = { cleanMode = false },
                         modifier = Modifier
@@ -644,7 +731,7 @@ fun DramaSeriesPlayerScreen(
 
                 // Bottom-left compact drama title (tap to view details)
                 AnimatedVisibility(
-                    visible = !cleanMode && !longPressActive && !isFullscreen && !inPip,
+                    visible = !effectiveCleanMode && !longPressActive && !isFullscreen && !inPip,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier
@@ -681,9 +768,9 @@ fun DramaSeriesPlayerScreen(
             }
         }
 
-        // Top bar (auto-hides during active fullscreen playback)
+        // Top bar (auto-hides during active fullscreen or auto-clean playback)
         AnimatedVisibility(
-            visible = !cleanMode && !longPressActive && !inPip && (!isFullscreen || fullscreenControlsVisible),
+            visible = !effectiveCleanMode && !longPressActive && !inPip && (!isFullscreen || fullscreenControlsVisible),
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
@@ -707,7 +794,11 @@ fun DramaSeriesPlayerScreen(
                 }
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    text = "${loadedDetail.title} · 第${pagerState.currentPage + 1}/${loadedDetail.episodes.size}集",
+                    text = if (isFullscreen) {
+                        "${loadedDetail.title} · 第${pagerState.currentPage + 1}/${loadedDetail.episodes.size}集"
+                    } else {
+                        "第${pagerState.currentPage + 1}/${loadedDetail.episodes.size}集"
+                    },
                     color = Color.White,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -715,7 +806,7 @@ fun DramaSeriesPlayerScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { openDetailSheet() }
+                        .clickable { if (isFullscreen) openDetailSheet() else openEpisodeSheet() }
                 )
                 if (sleepState.mode != SleepTimerMode.OFF) {
                     Spacer(Modifier.width(8.dp))
@@ -791,13 +882,13 @@ fun DramaSeriesPlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = (showAutoResumeBanner || showSleepEndedHint) && !cleanMode && !inPip,
+            visible = (showAutoResumeBanner || showSleepEndedHint || !episodeToastText.isNullOrBlank()) && !inPip,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
-                .padding(top = 56.dp)
+                .padding(top = if (effectiveCleanMode) 16.dp else 56.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -805,7 +896,7 @@ fun DramaSeriesPlayerScreen(
                 modifier = Modifier
                     .padding(horizontal = 16.dp)
                     .clip(RoundedCornerShape(18.dp))
-                    .background(Color.Black.copy(alpha = 0.8f))
+                    .background(Color.Black.copy(alpha = 0.78f))
                     .padding(horizontal = 14.dp, vertical = 7.dp)
             ) {
                 if (showAutoResumeBanner) {
@@ -827,33 +918,72 @@ fun DramaSeriesPlayerScreen(
                             exitExplicitly()
                         }
                     )
-                } else {
+                } else if (showSleepEndedHint) {
                     Text(
                         text = "睡眠定时已到，已自动暂停播放",
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
                     )
+                } else if (!episodeToastText.isNullOrBlank()) {
+                    Text(
+                        text = episodeToastText.orEmpty(),
+                        color = Color.White.copy(alpha = 0.92f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
         }
 
         if (showSeriesEndedCard && !inPip) {
+            val excludedForEnd = remember(history, feedPrefs.dislikedSeriesIds) {
+                buildSet {
+                    addAll(feedPrefs.dislikedSeriesIds)
+                    for (h in history) {
+                        if (isHistoryCompleted(h)) add(h.seriesId)
+                    }
+                }
+            }
+            val endSuggestion = remember(relatedBundle, loadedDetail.seriesId, excludedForEnd) {
+                resolveSeriesEndSuggestion(relatedBundle, loadedDetail.seriesId, excludedForEnd)
+            }
+            var endCountdownSec by remember(showSeriesEndedCard) { mutableIntStateOf(5) }
+            var endCountdownCancelled by remember(showSeriesEndedCard) { mutableStateOf(false) }
+
+            LaunchedEffect(showSeriesEndedCard, endCountdownCancelled, relatedLoading, endSuggestion) {
+                if (!showSeriesEndedCard || endCountdownCancelled || relatedLoading) return@LaunchedEffect
+                endCountdownSec = 5
+                while (endCountdownSec > 0) {
+                    delay(1_000L)
+                    endCountdownSec -= 1
+                }
+                val nextSeason = endSuggestion.nextSeason
+                showSeriesEndedCard = false
+                if (nextSeason != null) {
+                    container.localStore.clearResumePlayback()
+                    onSwitchSeries(nextSeason.summary.seriesId)
+                } else {
+                    exitExplicitly()
+                }
+            }
+
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.62f))
+                    .background(Color.Black.copy(alpha = 0.68f))
                     .clickable(onClick = {})
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier
-                        .padding(horizontal = 28.dp)
+                        .padding(horizontal = 24.dp)
+                        .widthIn(max = 360.dp)
                         .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0xFF1A1A20).copy(alpha = 0.96f))
-                        .padding(horizontal = 22.dp, vertical = 22.dp)
+                        .background(Color(0xFF1A1A20).copy(alpha = 0.97f))
+                        .padding(horizontal = 20.dp, vertical = 20.dp)
                 ) {
                     Text(
                         text = "本季已全部看完",
@@ -862,48 +992,224 @@ fun DramaSeriesPlayerScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "共 ${loadedDetail.episodes.size} 集 · 感谢观看「${loadedDetail.title}」",
+                        text = "共 ${loadedDetail.episodes.size} 集 · 《${loadedDetail.title}》",
                         color = Color.White.copy(alpha = 0.72f),
                         fontSize = 13.sp,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Button(
-                        onClick = {
-                            showSeriesEndedCard = false
-                            openDetailSheet()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = CoralRed),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("查看系列 / 相关推荐", color = Color.White, fontWeight = FontWeight.SemiBold)
-                    }
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        OutlinedButton(
+
+                    val nextSeason = endSuggestion.nextSeason
+                    val recDrama = endSuggestion.recommended
+                    if (nextSeason != null) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White.copy(alpha = 0.06f))
+                                .border(0.8.dp, CoralRed.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                                .padding(10.dp)
+                        ) {
+                            if (nextSeason.summary.cover.isNotEmpty()) {
+                                AsyncImage(
+                                    model = nextSeason.summary.cover,
+                                    contentDescription = nextSeason.summary.title,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .width(48.dp)
+                                        .height(64.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    text = "下一季 · ${nextSeason.displayLabel}",
+                                    color = CoralRed,
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = nextSeason.summary.title,
+                                    color = Color.White,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (nextSeason.summary.episodeCount > 0) {
+                                    Text(
+                                        text = "共 ${nextSeason.summary.episodeCount} 集",
+                                        color = Color.White.copy(alpha = 0.6f),
+                                        fontSize = 11.sp
+                                    )
+                                }
+                            }
+                        }
+                        val nextLabel = if (!endCountdownCancelled && !relatedLoading) {
+                            "立即播放下一季 (${endCountdownSec}s)"
+                        } else "立即播放下一季"
+                        Button(
                             onClick = {
                                 showSeriesEndedCard = false
-                                replayTrigger++
+                                container.localStore.clearResumePlayback()
+                                onSwitchSeries(nextSeason.summary.seriesId)
                             },
-                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                            colors = ButtonDefaults.buttonColors(containerColor = CoralRed),
                             shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("重播本集", color = Color.White, fontSize = 13.sp)
+                            Text(nextLabel, color = Color.White, fontWeight = FontWeight.SemiBold)
                         }
-                        OutlinedButton(
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    showSeriesEndedCard = false
+                                    replayTrigger++
+                                },
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("重播本集", color = Color.White, fontSize = 13.sp)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    showSeriesEndedCard = false
+                                    exitExplicitly()
+                                },
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("返回首页", color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
+                            }
+                        }
+                    } else {
+                        if (recDrama != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color.White.copy(alpha = 0.06f))
+                                    .clickable {
+                                        showSeriesEndedCard = false
+                                        container.localStore.clearResumePlayback()
+                                        onSwitchSeries(recDrama.summary.seriesId)
+                                    }
+                                    .padding(10.dp)
+                            ) {
+                                if (recDrama.summary.cover.isNotEmpty()) {
+                                    AsyncImage(
+                                        model = recDrama.summary.cover,
+                                        contentDescription = recDrama.summary.title,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .width(48.dp)
+                                            .height(64.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                    )
+                                }
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = recDrama.badge.ifBlank { "同题材推荐" },
+                                        color = Color(0xFF8EC5FF),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = recDrama.summary.title,
+                                        color = Color.White,
+                                        fontSize = 13.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (recDrama.summary.episodeCount > 0) {
+                                        Text(
+                                            text = "共 ${recDrama.summary.episodeCount} 集",
+                                            color = Color.White.copy(alpha = 0.6f),
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        val homeLabel = if (!endCountdownCancelled && !relatedLoading) {
+                            "返回首页 (${endCountdownSec}s)"
+                        } else "返回首页"
+                        Button(
                             onClick = {
                                 showSeriesEndedCard = false
                                 exitExplicitly()
                             },
-                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                            colors = ButtonDefaults.buttonColors(containerColor = CoralRed),
                             shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("返回", color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
+                            Text(homeLabel, color = Color.White, fontWeight = FontWeight.SemiBold)
                         }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            if (recDrama != null) {
+                                OutlinedButton(
+                                    onClick = {
+                                        showSeriesEndedCard = false
+                                        container.localStore.clearResumePlayback()
+                                        onSwitchSeries(recDrama.summary.seriesId)
+                                    },
+                                    border = BorderStroke(1.dp, CoralRed.copy(alpha = 0.55f)),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.weight(1.2f)
+                                ) {
+                                    Text("播下一部推荐", color = CoralRed, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = {
+                                        showSeriesEndedCard = false
+                                        openDetailSheet()
+                                    },
+                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.weight(1.2f)
+                                ) {
+                                    Text("查看相关推荐", color = Color.White, fontSize = 12.5.sp, maxLines = 1)
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    showSeriesEndedCard = false
+                                    replayTrigger++
+                                },
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("重播本集", color = Color.White, fontSize = 12.5.sp, maxLines = 1)
+                            }
+                        }
+                    }
+
+                    if (!endCountdownCancelled && !relatedLoading) {
+                        Text(
+                            text = "取消自动跳转",
+                            color = Color.White.copy(alpha = 0.6f),
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { endCountdownCancelled = true }
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
                     }
                 }
             }

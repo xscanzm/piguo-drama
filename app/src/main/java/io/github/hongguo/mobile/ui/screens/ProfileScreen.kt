@@ -101,7 +101,7 @@ fun ProfileScreen(container: AppContainer) {
     }
 
     val qualityPref = QualityPreference.entries.firstOrNull { it.key == settings.quality } ?: QualityPreference.AUTO
-    val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+    val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -322,7 +322,7 @@ fun ProfileScreen(container: AppContainer) {
         ) {
             Text("默认倍速（播放画面长按可临时 2.0x）", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                 speeds.forEach { spd ->
                     val selected = kotlin.math.abs(spd - settings.playbackSpeed) < 0.01f
                     Box(
@@ -332,12 +332,13 @@ fun ProfileScreen(container: AppContainer) {
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (selected) CoralRed else SurfaceElevated)
                             .clickable { container.localStore.updateSettings { it.copy(playbackSpeed = spd) } }
-                            .padding(vertical = 10.dp)
+                            .padding(vertical = 10.dp, horizontal = 2.dp)
                     ) {
                         Text(
                             text = "${spd}x",
                             color = Color.White,
-                            fontSize = 13.sp,
+                            fontSize = 12.sp,
+                            maxLines = 1,
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
                         )
                     }
@@ -461,6 +462,24 @@ fun ProfileScreen(container: AppContainer) {
                         if (!checked) {
                             container.localStore.clearResumePlayback()
                         }
+                    },
+                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = CoralRed)
+                )
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("全集播放自动清屏", color = TextPrimary, fontSize = 15.sp)
+                    Text("进入全集 3 秒后自动隐藏控件与进度条，单击暂停时重新显示", color = TextSecondary, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = settings.autoCleanFullSeriesPlayer,
+                    onCheckedChange = { checked ->
+                        container.localStore.updateSettings { it.copy(autoCleanFullSeriesPlayer = checked) }
                     },
                     colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = CoralRed)
                 )

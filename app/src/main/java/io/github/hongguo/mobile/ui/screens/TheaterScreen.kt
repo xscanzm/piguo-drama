@@ -69,7 +69,9 @@ import io.github.hongguo.mobile.core.CatalogCategory
 import io.github.hongguo.mobile.core.DramaSummary
 import io.github.hongguo.mobile.core.GenreItem
 import io.github.hongguo.mobile.core.SearchCursor
+import io.github.hongguo.mobile.core.WatchHistoryEntry
 import io.github.hongguo.mobile.core.friendlyErrorMessage
+import io.github.hongguo.mobile.core.isHistoryCompleted
 import io.github.hongguo.mobile.ui.components.CategoryTagChips
 import io.github.hongguo.mobile.ui.theme.BgBlack
 import io.github.hongguo.mobile.ui.theme.CoralRed
@@ -94,6 +96,10 @@ fun TheaterScreen(
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
     val searchHistory by container.localStore.searchHistory.collectAsState()
+    val history by container.localStore.history.collectAsState()
+    val favorites by container.localStore.favorites.collectAsState()
+    val historyMap = remember(history) { history.associateBy { it.seriesId } }
+    val favoriteIds = remember(favorites) { favorites.mapTo(HashSet()) { it.seriesId } }
 
     var searchQuery by remember { mutableStateOf("") }
     var activeSearchKeyword by remember { mutableStateOf("") }
@@ -465,7 +471,12 @@ fun TheaterScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(items, key = { it.seriesId }) { drama ->
-                    DramaPosterCard(drama = drama, onClick = { onOpenSeries(drama.seriesId) })
+                    DramaPosterCard(
+                        drama = drama,
+                        watchHistory = historyMap[drama.seriesId],
+                        isFavorite = drama.seriesId in favoriteIds,
+                        onClick = { onOpenSeries(drama.seriesId) }
+                    )
                 }
                 if (loading) {
                     item(span = { GridItemSpan(3) }) {
@@ -533,7 +544,18 @@ private fun GenreChip(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun DramaPosterCard(drama: DramaSummary, onClick: () -> Unit) {
+private fun DramaPosterCard(
+    drama: DramaSummary,
+    watchHistory: WatchHistoryEntry? = null,
+    isFavorite: Boolean = false,
+    onClick: () -> Unit
+) {
+    val statusBadge: Pair<String, Color>? = when {
+        watchHistory != null && isHistoryCompleted(watchHistory) -> "已看完" to Color(0xFF7AD97A)
+        watchHistory != null -> "看到第${watchHistory.lastEpisodeIndex}集" to CoralRed
+        isFavorite -> "已追" to CoralRed
+        else -> null
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -585,6 +607,24 @@ private fun DramaPosterCard(drama: DramaSummary, onClick: () -> Unit) {
                     )
                 }
             }
+            if (drama.rank == null && statusBadge != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(6.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color.Black.copy(alpha = 0.72f))
+                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = statusBadge.first,
+                        color = statusBadge.second,
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1
+                    )
+                }
+            }
             val epText = when {
                 drama.episodeLabel.isNotEmpty() -> drama.episodeLabel
                 drama.episodeCount > 0 -> "共${drama.episodeCount}集"
@@ -626,5 +666,16 @@ private fun DramaPosterCard(drama: DramaSummary, onClick: () -> Unit) {
             overflow = TextOverflow.Ellipsis,
             lineHeight = 17.sp
         )
+        if (drama.rank != null && statusBadge != null) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = statusBadge.first,
+                color = statusBadge.second,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }

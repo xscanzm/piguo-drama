@@ -121,6 +121,20 @@ fun EpisodePickerSheet(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                if (selectedRange != initialRange) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "回到第${currentEpisodeIndex}集",
+                        color = CoralRed,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(CoralRed.copy(alpha = 0.16f))
+                            .clickable { selectedRange = initialRange }
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = "共 $total 集",
@@ -228,8 +242,15 @@ fun EpisodePickerSheet(
             }
 
             if (totalRanges > 1) {
+                val rangeRowState = rememberLazyListState()
+                LaunchedEffect(selectedRange) {
+                    rangeRowState.animateScrollToItem(selectedRange.coerceIn(0, totalRanges - 1))
+                }
                 Spacer(Modifier.height(12.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LazyRow(
+                    state = rangeRowState,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     items(totalRanges) { rIdx ->
                         val start = rIdx * pageSize + 1
                         val end = minOf((rIdx + 1) * pageSize, total)
@@ -355,7 +376,7 @@ fun SpeedQualitySheet(
     onSelectQuality: (QualityPreference) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+    val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -373,7 +394,7 @@ fun SpeedQualitySheet(
             Text("播放倍速", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 speeds.forEach { spd ->
@@ -393,7 +414,8 @@ fun SpeedQualitySheet(
                         Text(
                             text = "${spd}x",
                             color = Color.White,
-                            fontSize = 14.sp,
+                            fontSize = 12.5.sp,
+                            maxLines = 1,
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
                         )
                     }
@@ -485,26 +507,43 @@ fun SpeedQualitySheet(
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-                SleepTimerMode.entries.forEach { m ->
-                    val selected = sleepTimerState.mode == m
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (selected) CoralRed.copy(alpha = 0.2f) else SurfaceElevated)
-                            .border(1.dp, if (selected) CoralRed else Color.Transparent, RoundedCornerShape(10.dp))
-                            .clickable { onSelectSleepTimer(m) }
-                            .padding(vertical = 9.dp, horizontal = 2.dp)
-                    ) {
-                        Text(
-                            text = m.label,
-                            color = if (selected) CoralRed else TextPrimary,
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-                        )
+            val sleepRows = listOf(
+                listOf(
+                    SleepTimerMode.OFF,
+                    SleepTimerMode.AFTER_EPISODE,
+                    SleepTimerMode.AFTER_3_EPISODES,
+                    SleepTimerMode.AFTER_5_EPISODES
+                ),
+                listOf(
+                    SleepTimerMode.MIN_15,
+                    SleepTimerMode.MIN_30,
+                    SleepTimerMode.MIN_60
+                )
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                sleepRows.forEach { rowModes ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                        rowModes.forEach { m ->
+                            val selected = sleepTimerState.mode == m
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (selected) CoralRed.copy(alpha = 0.2f) else SurfaceElevated)
+                                    .border(1.dp, if (selected) CoralRed else Color.Transparent, RoundedCornerShape(10.dp))
+                                    .clickable { onSelectSleepTimer(m) }
+                                    .padding(vertical = 9.dp, horizontal = 2.dp)
+                            ) {
+                                Text(
+                                    text = m.label,
+                                    color = if (selected) CoralRed else TextPrimary,
+                                    fontSize = 11.5.sp,
+                                    maxLines = 1,
+                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                                )
+                            }
+                        }
                     }
                 }
             }

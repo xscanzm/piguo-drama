@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package io.github.hongguo.mobile.core
 
+import io.github.hongguo.mobile.player.SleepTimerManager
+import io.github.hongguo.mobile.player.SleepTimerMode
+import io.github.hongguo.mobile.ui.components.shouldShowFullscreenControls
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -216,5 +219,152 @@ class StabilityAndUxTest {
         assertFalse(isHistoryCompleted(mid))
         assertFalse(isHistoryCompleted(mid.copy(lastEpisodeIndex = 40, positionMs = 85_000L)))
         assertTrue(isHistoryCompleted(mid.copy(lastEpisodeIndex = 40, positionMs = 90_000L)))
+    }
+
+    @Test
+    fun resolveSeriesEndSuggestionPicksNextSeasonOrUnseenRecommended() {
+        val s1 = SeriesSeasonItem(DramaSummary(seriesId = "s1", title = "传世 第1季"), 1, "第1季", false)
+        val s2 = SeriesSeasonItem(DramaSummary(seriesId = "s2", title = "传世 第2季"), 2, "第2季", true)
+        val s3 = SeriesSeasonItem(DramaSummary(seriesId = "s3", title = "传世 第3季"), 3, "第3季", false)
+        val rSeen = RelatedDramaItem(DramaSummary(seriesId = "r1", title = "已看剧"), RelatedDramaKind.SIMILAR, "相似")
+        val rFresh = RelatedDramaItem(DramaSummary(seriesId = "r2", title = "未看剧"), RelatedDramaKind.OTHER_VERSION, "同IP")
+
+        val midBundle = RelatedDramaBundle(
+            keyword = "传世",
+            seasons = listOf(s1, s2, s3),
+            related = listOf(rSeen, rFresh)
+        )
+        val midSuggestion = resolveSeriesEndSuggestion(midBundle, "s2", excludedSeriesIds = setOf("r1"))
+        assertEquals("s3", midSuggestion.nextSeason?.summary?.seriesId)
+        assertEquals("r2", midSuggestion.recommended?.summary?.seriesId)
+
+        val lastBundle = RelatedDramaBundle(
+            keyword = "传世",
+            seasons = listOf(s1, s2.copy(isCurrent = false), s3.copy(isCurrent = true)),
+            related = listOf(rSeen, rFresh)
+        )
+        val lastSuggestion = resolveSeriesEndSuggestion(lastBundle, "s3", excludedSeriesIds = setOf("r1"))
+        assertEquals(null, lastSuggestion.nextSeason)
+        assertEquals("r2", lastSuggestion.recommended?.summary?.seriesId)
+
+        val emptySuggestion = resolveSeriesEndSuggestion(null, "s3")
+        assertEquals(null, emptySuggestion.nextSeason)
+        assertEquals(null, emptySuggestion.recommended)
+    }
+
+    @Test
+    fun sleepTimerCountsDownEpisodesBeforeTriggering() {
+        val mgr = SleepTimerManager()
+        mgr.setMode(SleepTimerMode.AFTER_3_EPISODES)
+        assertEquals("余3集", SleepTimerManager.formatRemaining(mgr.state.value))
+
+        assertFalse(mgr.consumeEpisodeEndTrigger())
+        assertEquals("余2集", SleepTimerManager.formatRemaining(mgr.state.value))
+        assertEquals(0, mgr.state.value.triggerCount)
+
+        assertFalse(mgr.consumeEpisodeEndTrigger())
+        assertEquals("播完本集", SleepTimerManager.formatRemaining(mgr.state.value))
+        assertEquals(0, mgr.state.value.triggerCount)
+
+        assertTrue(mgr.consumeEpisodeEndTrigger())
+        assertEquals(SleepTimerMode.OFF, mgr.state.value.mode)
+        assertEquals("", SleepTimerManager.formatRemaining(mgr.state.value))
+        assertEquals(1, mgr.state.value.triggerCount)
+    }
+
+    @Test
+    fun fullscreenControlsStayHiddenAcrossEpisodeTransitionWhenHudHidden() {
+        // Hidden HUD stays hidden even while the next episode is still loading/buffering
+        assertFalse(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = false,
+                fullscreenHudVisible = false,
+                isUserPaused = false,
+                isScrubbing = false,
+                hasError = false
+            )
+        )
+        // Explicit triggers reveal controls
+        assertTrue(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = false,
+                fullscreenHudVisible = true,
+                isUserPaused = false,
+                isScrubbing = false,
+                hasError = false
+            )
+        )
+        assertTrue(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = false,
+                fullscreenHudVisible = false,
+                isUserPaused = true,
+                isScrubbing = false,
+                hasError = false
+            )
+        )
+        assertTrue(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = false,
+                fullscreenHudVisible = false,
+                isUserPaused = false,
+                isScrubbing = true,
+                hasError = false
+            )
+        )
+        assertTrue(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = false,
+                fullscreenHudVisible = false,
+                isUserPaused = false,
+                isScrubbing = false,
+                hasError = true
+            )
+        )
+        // Locked fullscreen or PiP hides controls regardless
+        assertFalse(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = true,
+                isScreenLocked = true,
+                fullscreenHudVisible = true,
+                isUserPaused = true,
+                isScrubbing = true,
+                hasError = true
+            )
+        )
+        assertFalse(
+            shouldShowFullscreenControls(
+                isInPipMode = true,
+                isFullscreen = false,
+                isScreenLocked = false,
+                fullscreenHudVisible = true,
+                isUserPaused = true,
+                isScrubbing = false,
+                hasError = false
+            )
+        )
+        // Normal portrait playback allows controls
+        assertTrue(
+            shouldShowFullscreenControls(
+                isInPipMode = false,
+                isFullscreen = false,
+                isScreenLocked = false,
+                fullscreenHudVisible = false,
+                isUserPaused = false,
+                isScrubbing = false,
+                hasError = false
+            )
+        )
     }
 }

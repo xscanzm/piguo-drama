@@ -108,6 +108,21 @@ import kotlin.math.roundToInt
 
 private enum class FullscreenGestureMode { NONE, SEEK, BRIGHTNESS, VOLUME }
 
+internal fun shouldShowFullscreenControls(
+    isInPipMode: Boolean,
+    isFullscreen: Boolean,
+    isScreenLocked: Boolean,
+    fullscreenHudVisible: Boolean,
+    isUserPaused: Boolean,
+    isScrubbing: Boolean,
+    hasError: Boolean
+): Boolean {
+    if (isInPipMode) return false
+    if (!isFullscreen) return true
+    if (isScreenLocked) return false
+    return fullscreenHudVisible || isUserPaused || isScrubbing || hasError
+}
+
 @OptIn(UnstableApi::class)
 @Composable
 fun VerticalDramaPlayer(
@@ -132,6 +147,10 @@ fun VerticalDramaPlayer(
     isFullscreen: Boolean = false,
     onToggleFullscreen: (Boolean) -> Unit = {},
     onControlsVisibilityChange: (Boolean) -> Unit = {},
+    fullscreenHudVisible: Boolean? = null,
+    onFullscreenHudVisibleChange: ((Boolean) -> Unit)? = null,
+    isFullscreenLocked: Boolean? = null,
+    onFullscreenLockedChange: ((Boolean) -> Unit)? = null,
     onVideoAspectKnown: (width: Int, height: Int) -> Unit = { _, _ -> },
     onFlushProgress: () -> Unit = {},
     showSeekBar: Boolean = true,
@@ -143,6 +162,9 @@ fun VerticalDramaPlayer(
     onAutoRecover: (() -> Unit)? = null,
     onPlaybackPlayingChange: (Boolean) -> Unit = {},
     remoteCommandTrigger: Pair<Int, PlaybackRemoteCommand>? = null,
+    onUserPausedChange: (Boolean) -> Unit = {},
+    canDowngradeQuality: Boolean = false,
+    onQuickDowngradeQuality: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -156,10 +178,13 @@ fun VerticalDramaPlayer(
     var isUserPaused by remember { mutableStateOf(false) }
     var isBuffering by remember { mutableStateOf(false) }
     var showMidBuffering by remember { mutableStateOf(false) }
+    var showSlowNetworkHint by remember { mutableStateOf(false) }
     var isLongPressing by remember { mutableStateOf(false) }
-    var isScreenLocked by remember(isFullscreen) { mutableStateOf(false) }
+    var localScreenLocked by remember(isFullscreen) { mutableStateOf(false) }
     var lockHintVisible by remember(isFullscreen) { mutableStateOf(false) }
-    var fullscreenHudVisible by remember(isFullscreen) { mutableStateOf(true) }
+    var localFullscreenHudVisible by remember(isFullscreen) { mutableStateOf(true) }
+    val isScreenLocked = isFullscreenLocked ?: localScreenLocked
+    val effectiveFullscreenHudVisible = fullscreenHudVisible ?: localFullscreenHudVisible
     var fullscreenHudPulse by remember { mutableIntStateOf(0) }
     var playerError by remember { mutableStateOf<String?>(null) }
     var currentPosMs by remember { mutableLongStateOf(0L) }
@@ -179,6 +204,10 @@ fun VerticalDramaPlayer(
     val latestMediaSource by rememberUpdatedState(mediaSource)
     val latestIsActive by rememberUpdatedState(isActive)
     val latestIsUserPaused by rememberUpdatedState(isUserPaused)
+    val latestIsScreenLocked by rememberUpdatedState(isScreenLocked)
+    val latestFullscreenHudVisible by rememberUpdatedState(effectiveFullscreenHudVisible)
+    val latestOnFullscreenHudVisibleChange by rememberUpdatedState(onFullscreenHudVisibleChange)
+    val latestOnFullscreenLockedChange by rememberUpdatedState(onFullscreenLockedChange)
     val latestPlayerError by rememberUpdatedState(playerError)
     val latestFlushProgress by rememberUpdatedState(onFlushProgress)
     val latestBackgroundAudio by rememberUpdatedState(backgroundAudioPlay)
@@ -189,6 +218,18 @@ fun VerticalDramaPlayer(
     val latestCanAutoRecover by rememberUpdatedState(canAutoRecover)
     val latestOnAutoRecover by rememberUpdatedState(onAutoRecover)
     val latestOnPlaybackPlayingChange by rememberUpdatedState(onPlaybackPlayingChange)
+    val latestOnUserPausedChange by rememberUpdatedState(onUserPausedChange)
+    val latestOnQuickDowngrade by rememberUpdatedState(onQuickDowngradeQuality)
+
+    fun updateFullscreenHudVisible(visible: Boolean) {
+        val cb = latestOnFullscreenHudVisibleChange
+        if (cb != null) cb(visible) else localFullscreenHudVisible = visible
+    }
+
+    fun updateScreenLocked(locked: Boolean) {
+        val cb = latestOnFullscreenLockedChange
+        if (cb != null) cb(locked) else localScreenLocked = locked
+    }
 
     LaunchedEffect(lockHintVisible, isScreenLocked) {
         if (lockHintVisible && isScreenLocked) {
@@ -198,17 +239,18 @@ fun VerticalDramaPlayer(
     }
 
     LaunchedEffect(
+        isActive,
         isFullscreen,
-        fullscreenHudVisible,
+        effectiveFullscreenHudVisible,
         isPlaying,
         isUserPaused,
         isScrubbing,
         isScreenLocked,
         fullscreenHudPulse
     ) {
-        if (isFullscreen && fullscreenHudVisible && isPlaying && !isUserPaused && !isScrubbing && !isScreenLocked) {
+        if (isActive && isFullscreen && effectiveFullscreenHudVisible && isPlaying && !isUserPaused && !isScrubbing && !isScreenLocked) {
             delay(3500L)
-            fullscreenHudVisible = false
+            updateFullscreenHudVisible(false)
         }
     }
 
@@ -219,6 +261,19 @@ fun VerticalDramaPlayer(
         } else {
             showMidBuffering = false
         }
+    }
+
+    LaunchedEffect(mediaSource, isBuffering, isUserPaused, playerError, canDowngradeQuality) {
+        if (mediaSource != null && isBuffering && !isUserPaused && playerError == null && canDowngradeQuality && latestOnQuickDowngrade != null) {
+            delay(5_000L)
+            showSlowNetworkHint = true
+        } else {
+            showSlowNetworkHint = false
+        }
+    }
+
+    LaunchedEffect(isUserPaused, isActive) {
+        latestOnUserPausedChange(isActive && isUserPaused)
     }
 
     val activeSource = remember(mediaSource, fallbackIndex) {
@@ -387,6 +442,7 @@ fun VerticalDramaPlayer(
         }
         exoPlayer.addListener(listener)
         onDispose {
+            latestOnUserPausedChange(false)
             latestOnPlaybackPlayingChange(false)
             latestFlushProgress()
             playerViewRef?.player = null
@@ -440,10 +496,19 @@ fun VerticalDramaPlayer(
         }
     }
 
-    val controlsVisibleInFullscreen = !isInPipMode &&
-        (!isFullscreen || (!isScreenLocked && (fullscreenHudVisible || isUserPaused || (!isPlaying && !isBuffering) || isScrubbing)))
-    LaunchedEffect(controlsVisibleInFullscreen, isFullscreen) {
-        onControlsVisibilityChange(controlsVisibleInFullscreen)
+    val controlsVisibleInFullscreen = shouldShowFullscreenControls(
+        isInPipMode = isInPipMode,
+        isFullscreen = isFullscreen,
+        isScreenLocked = isScreenLocked,
+        fullscreenHudVisible = effectiveFullscreenHudVisible,
+        isUserPaused = isUserPaused,
+        isScrubbing = isScrubbing,
+        hasError = playerError != null || errorMessage != null
+    )
+    LaunchedEffect(isActive, controlsVisibleInFullscreen, isFullscreen) {
+        if (isActive) {
+            onControlsVisibilityChange(controlsVisibleInFullscreen)
+        }
     }
 
     val cropToFill = fitModeFill && !isLandscapeVideo && !isFullscreen
@@ -459,17 +524,18 @@ fun VerticalDramaPlayer(
             .fillMaxSize()
             .background(Color.Black)
             .clipToBounds()
-            .pointerInput(mediaSource, isActive, isFullscreen, isScreenLocked, isInPipMode) {
+            .pointerInput(mediaSource, isActive, isFullscreen, isInPipMode) {
                 detectTapGestures(
                     onTap = {
                         if (isInPipMode) return@detectTapGestures
-                        if (isFullscreen && isScreenLocked) {
+                        if (isFullscreen && latestIsScreenLocked) {
                             lockHintVisible = !lockHintVisible
                             return@detectTapGestures
                         }
                         if (isFullscreen) {
-                            fullscreenHudVisible = !fullscreenHudVisible
-                            if (fullscreenHudVisible) fullscreenHudPulse++
+                            val nextHud = !latestFullscreenHudVisible
+                            updateFullscreenHudVisible(nextHud)
+                            if (nextHud) fullscreenHudPulse++
                             onTapScreen()
                             return@detectTapGestures
                         }
@@ -482,17 +548,17 @@ fun VerticalDramaPlayer(
                     },
                     onDoubleTap = if (isFullscreen) {
                         {
-                            if (!isInPipMode && !isScreenLocked && mediaSource != null && playerError == null) {
+                            if (!isInPipMode && !latestIsScreenLocked && mediaSource != null && playerError == null) {
                                 isUserPaused = !isUserPaused
                                 exoPlayer.playWhenReady = !isUserPaused
                                 if (isUserPaused) latestFlushProgress()
-                                fullscreenHudVisible = true
+                                updateFullscreenHudVisible(true)
                                 fullscreenHudPulse++
                             }
                         }
                     } else null,
                     onLongPress = {
-                        if (isFullscreen && isScreenLocked) return@detectTapGestures
+                        if (isFullscreen && latestIsScreenLocked) return@detectTapGestures
                         if (mediaSource != null && isActive) {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             isLongPressing = true
@@ -757,6 +823,29 @@ fun VerticalDramaPlayer(
             )
         }
 
+        if (!isInPipMode && showSlowNetworkHint && latestOnQuickDowngrade != null && playerError == null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(top = 86.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color.Black.copy(alpha = 0.78f))
+                    .border(0.8.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(18.dp))
+                    .clickable {
+                        showSlowNetworkHint = false
+                        latestOnQuickDowngrade?.invoke()
+                    }
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Text(
+                    text = "网络较慢 · 切换 480P 流畅播",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+
         if (isFullscreen) {
             AnimatedVisibility(
                 visible = !isInPipMode && !isScreenLocked && controlsVisibleInFullscreen && !isLoading && playerError == null && mediaSource != null,
@@ -883,12 +972,12 @@ fun VerticalDramaPlayer(
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     if (isScreenLocked) {
-                        isScreenLocked = false
+                        updateScreenLocked(false)
                         lockHintVisible = false
-                        fullscreenHudVisible = true
+                        updateFullscreenHudVisible(true)
                         fullscreenHudPulse++
                     } else {
-                        isScreenLocked = true
+                        updateScreenLocked(true)
                         lockHintVisible = true
                         isUserPaused = false
                         exoPlayer.playWhenReady = true
@@ -994,6 +1083,7 @@ fun VerticalDramaPlayer(
                 fraction = fraction,
                 bufferedFraction = bufferedFraction,
                 isScrubbing = isScrubbing,
+                showTimeBar = isUserPaused || isFullscreen,
                 currentMs = if (isScrubbing) (scrubFraction * durationMs).toLong() else currentPosMs,
                 durationMs = durationMs,
                 onScrubStart = { f ->
@@ -1026,6 +1116,7 @@ private fun ThinVideoProgressBar(
     fraction: Float,
     bufferedFraction: Float,
     isScrubbing: Boolean,
+    showTimeBar: Boolean = false,
     currentMs: Long,
     durationMs: Long,
     onScrubStart: (Float) -> Unit,
@@ -1053,6 +1144,25 @@ private fun ThinVideoProgressBar(
                     .padding(horizontal = 12.dp, vertical = 4.dp)
             )
             Spacer(Modifier.height(8.dp))
+        } else if (showTimeBar) {
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 2.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = formatDuration(currentMs),
+                    color = Color.White.copy(alpha = 0.88f),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = formatDuration(durationMs),
+                    color = Color.White.copy(alpha = 0.72f),
+                    fontSize = 11.sp
+                )
+            }
         }
 
         val trackHeight = if (isScrubbing) 4.5.dp else 2.5.dp

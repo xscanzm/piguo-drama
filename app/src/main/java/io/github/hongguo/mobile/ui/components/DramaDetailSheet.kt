@@ -251,6 +251,13 @@ fun DramaDetailSheet(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(6.dp))
                                     .background(SurfaceElevated)
+                                    .then(
+                                        if (onSearchAll != null) {
+                                            Modifier
+                                                .border(0.6.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(6.dp))
+                                                .clickable { onSearchAll(tag) }
+                                        } else Modifier
+                                    )
                                     .padding(horizontal = 8.dp, vertical = 3.dp)
                             ) {
                                 Text(tag, color = TextPrimary.copy(alpha = 0.88f), fontSize = 11.sp)

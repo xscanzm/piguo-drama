@@ -37,3 +37,30 @@ fun isHistoryCompleted(entry: WatchHistoryEntry): Boolean = isSeriesCompleted(
     positionMs = entry.positionMs,
     durationMs = entry.durationMs
 )
+
+data class SeriesEndSuggestion(
+    val nextSeason: SeriesSeasonItem? = null,
+    val recommended: RelatedDramaItem? = null
+)
+
+fun resolveSeriesEndSuggestion(
+    bundle: RelatedDramaBundle?,
+    currentSeriesId: String,
+    excludedSeriesIds: Set<String> = emptySet()
+): SeriesEndSuggestion {
+    if (bundle == null) return SeriesEndSuggestion()
+    val seasons = bundle.seasons
+    val curIdx = seasons.indexOfFirst { it.isCurrent || it.summary.seriesId == currentSeriesId }
+    val nextSeason = if (curIdx >= 0 && curIdx + 1 < seasons.size) {
+        seasons[curIdx + 1].takeIf { it.summary.seriesId.isNotBlank() && it.summary.seriesId != currentSeriesId }
+    } else null
+
+    val recommended = bundle.related.firstOrNull { item ->
+        val sid = item.summary.seriesId
+        sid.isNotBlank() && sid != currentSeriesId && sid !in excludedSeriesIds
+    }
+    return SeriesEndSuggestion(
+        nextSeason = nextSeason,
+        recommended = recommended
+    )
+}
