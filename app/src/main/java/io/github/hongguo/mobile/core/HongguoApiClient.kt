@@ -222,6 +222,8 @@ class HongguoApiClient(
     private val catalogCursors = ConcurrentHashMap<String, MutableMap<Int, CursorState>>()
     private val recommendCursors = ConcurrentHashMap<String, MutableMap<Int, CursorState>>()
     private val mallFeedCursors = ConcurrentHashMap<String, MutableMap<Int, CursorState>>()
+    private val recommendFallbackPage = ConcurrentHashMap<String, Int>()
+    private val catalogFallbackPage = ConcurrentHashMap<String, Int>()
     private val seenRecFilters = ConcurrentHashMap<String, LinkedHashSet<String>>()
     private val persistedSeenRecFilters = java.util.Collections.synchronizedList(ArrayList<String>())
     private val dislikedRecFilters = java.util.Collections.synchronizedList(ArrayList<String>())
@@ -251,7 +253,7 @@ class HongguoApiClient(
 
     fun trimMemoryCaches() {
         pruneTimedCache(detailCache, 30) { expiresAt, now -> expiresAt <= now }
-        pruneTimedCache(prefetchedVariantsCache, 30) { createdAt, now -> now - createdAt >= 4 * 60_000L }
+        pruneTimedCache(prefetchedVariantsCache, 30) { createdAt, now -> now - createdAt >= 10 * 60_000L }
     }
 
     private fun currentCookieHeader(): String? =
@@ -401,37 +403,58 @@ class HongguoApiClient(
         page: Int = 1,
         forceRefresh: Boolean = false
     ): CatalogPageResult = withContext(Dispatchers.IO) {
+        if (forceRefresh && page == 1) {
+            mallFeedCursors.remove(channelKey)
+            recommendCursors.remove(channelKey)
+            catalogCursors.remove("$channelKey:")
+            recommendFallbackPage.remove(channelKey)
+            catalogFallbackPage.remove(channelKey)
+        }
         if (channelKey == "hot-drama") {
-            if (forceRefresh && page == 1) {
-                mallFeedCursors.remove(channelKey)
-            }
-            val mallResult = runCatching {
-                fetchMallPlayletFeed(channelKey, page, forceRefresh)
-            }.getOrNull()
-            if (mallResult != null && mallResult.items.isNotEmpty()) {
-                return@withContext mallResult
+            val canFetchMall = page == 1 || mallFeedCursors[channelKey]?.containsKey(page) == true
+            if (canFetchMall) {
+                val mallResult = runCatching {
+                    fetchMallPlayletFeed(channelKey, page, forceRefresh)
+                }.getOrNull()
+                if (mallResult != null && mallResult.items.isNotEmpty()) {
+                    return@withContext mallResult
+                }
             }
         }
         val selected = FEED_SELECTORS[channelKey]
         if (selected != null) {
-            if (forceRefresh && page == 1) {
-                recommendCursors.remove(channelKey)
+            val canUseDirectPage = channelKey != "hot-drama" &&
+                (page == 1 || recommendCursors[channelKey]?.containsKey(page) == true)
+            val recPage = if (canUseDirectPage) {
+                page
+            } else {
+                val stored = recommendFallbackPage[channelKey] ?: 1
+                if (stored > 1 && recommendCursors[channelKey]?.containsKey(stored) != true) 1 else stored
             }
             val recResult = runCatching {
-                fetchAppRecommendFeed(channelKey, selected, page)
+                fetchAppRecommendFeed(channelKey, selected, recPage)
             }.getOrNull()
             if (recResult != null && recResult.items.isNotEmpty()) {
-                return@withContext recResult
+                recommendFallbackPage[channelKey] = if (recResult.hasMore) recPage + 1 else 1
+                return@withContext recResult.copy(page = page)
             }
         }
         val fallbackCat = CatalogCategory.entries.firstOrNull { it.key == channelKey } ?: CatalogCategory.HOT_DRAMA
-        val startPage = if (page == 1 && forceRefresh) (1..3).random() else page
-        val catResult = fetchCatalog(fallbackCat, "", startPage, forceRefresh = forceRefresh)
-        if (forceRefresh && page == 1 && catResult.items.size > 1) {
-            catResult.copy(items = catResult.items.shuffled())
-        } else {
-            catResult
+        val catScopeKey = "${fallbackCat.key}:"
+        val storedCatPage = catalogFallbackPage[channelKey] ?: 1
+        val catPage = when {
+            page == 1 && forceRefresh -> (1..3).random()
+            storedCatPage > 1 && catalogCursors[catScopeKey]?.containsKey(storedCatPage) != true -> 1
+            else -> storedCatPage
         }
+        val catResult = fetchCatalog(fallbackCat, "", catPage, forceRefresh = forceRefresh && catPage == 1)
+        catalogFallbackPage[channelKey] = if (catResult.hasMore) catPage + 1 else 1
+        val adjusted = if (forceRefresh && page == 1 && catResult.items.size > 1) {
+            catResult.copy(items = catResult.items.shuffled(), page = page)
+        } else {
+            catResult.copy(page = page)
+        }
+        adjusted
     }
 
     suspend fun submitFeedDislike(summary: DramaSummary, reason: String = "不感兴趣") = withContext(Dispatchers.IO) {
@@ -674,8 +697,8 @@ class HongguoApiClient(
         val hasMore = data.optBoolean("has_more", view.optBoolean("has_more", false))
         val nextOffset = data.optInt("next_offset", view.optInt("next_offset", -1))
         val nextSessionId = data.optString("session_id", view.optString("session_id", ""))
-        if (hasMore && nextOffset > cursor.offset) {
-            cursors[page + 1] = CursorState(nextOffset, nextSessionId)
+        if (hasMore && (nextOffset > cursor.offset || (nextSessionId.isNotBlank() && nextSessionId != cursor.sessionId))) {
+            cursors[page + 1] = CursorState(nextOffset.coerceAtLeast(0), nextSessionId)
         } else {
             cursors.remove(page + 1)
         }
@@ -869,7 +892,7 @@ class HongguoApiClient(
                     if (parsed.variants.isNotEmpty()) {
                         prefetchedVariantsCache[vid] = System.currentTimeMillis() to parsed.variants
                         pruneTimedCache(prefetchedVariantsCache, 120) { createdAt, now ->
-                            now - createdAt >= 4 * 60_000L
+                            now - createdAt >= 10 * 60_000L
                         }
                     }
                 }
@@ -982,8 +1005,8 @@ class HongguoApiClient(
         val hasMore = data.optBoolean("has_more", view.optBoolean("has_more", false))
         val nextOffset = data.optInt("next_offset", view.optInt("next_offset", -1))
         val nextSessionId = data.optString("session_id", view.optString("session_id", ""))
-        if (hasMore && nextOffset > cursor.offset) {
-            cursors[page + 1] = CursorState(nextOffset, nextSessionId)
+        if (hasMore && (nextOffset > cursor.offset || (nextSessionId.isNotBlank() && nextSessionId != cursor.sessionId))) {
+            cursors[page + 1] = CursorState(nextOffset.coerceAtLeast(0), nextSessionId)
         } else {
             cursors.remove(page + 1)
         }
@@ -1887,7 +1910,7 @@ class HongguoApiClient(
     ): EpisodePlayResult = withContext(Dispatchers.IO) {
         require(Regex("^\\d{1,30}$").matches(vid)) { "分集编号无效" }
         val prefetched = prefetchedVariantsCache[vid]?.takeIf {
-            System.currentTimeMillis() - it.first < 4 * 60_000L
+            System.currentTimeMillis() - it.first < 10 * 60_000L
         }?.second
         if (!bypassCooldown && !prefetched.isNullOrEmpty() && canReusePrefetchedVariants(prefetched, preferredQuality)) {
             return@withContext EpisodePlayResult(vid = vid, variants = rankPlayVariants(prefetched, preferredQuality))
@@ -1987,8 +2010,13 @@ class HongguoApiClient(
             }
         }
 
+        val reqTimeoutMs = if (isBackground) 3_500L else 6_000L
+        val tier1HostLimit = if (isBackground) 2 else 4
+        val tier2HostLimit = if (isBackground) 1 else 3
+        val tier3HostLimit = if (isBackground) 1 else 2
+
         // Tier 1: Primary V5 POST /novel/player/video_model/v1/ with 7.4.5.32 profile
-        for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 4)) {
+        for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, tier1HostLimit)) {
             val startMs = System.currentTimeMillis()
             try {
                 val signed = LegacySigner.buildV5PlaybackRequest(
@@ -1999,7 +2027,7 @@ class HongguoApiClient(
                     apiPath = LegacySigner.VIDEO_MODEL_PATH,
                     currentAppProfile = true
                 )
-                val resp = executeSignedJson(signed, method = "POST", timeoutMs = 6_000L)
+                val resp = executeSignedJson(signed, method = "POST", timeoutMs = reqTimeoutMs)
                 val result = resolvePlayResponse(resp, vid, preferredQuality)
                 playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
                 return@withContext result
@@ -2013,7 +2041,7 @@ class HongguoApiClient(
 
         // Tier 2: V5 GET /novel/player/video_model/v1/ single-video fallback
         if (!v5ReturnedDataButUnusable) {
-            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 3)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, tier2HostLimit)) {
                 val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildV5SingleVideoModelGetRequest(
@@ -2022,7 +2050,7 @@ class HongguoApiClient(
                         hostOverride = host,
                         cookieHeader = null
                     )
-                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = 6_000L)
+                    val resp = executeSignedJson(signed, method = "GET", timeoutMs = reqTimeoutMs)
                     val result = resolvePlayResponse(resp, vid, preferredQuality)
                     playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
                     return@withContext result
@@ -2030,14 +2058,14 @@ class HongguoApiClient(
                     if (e !is ByteVc2OnlyException && e !is IncompleteEncryptionException) {
                         playbackHostSelector.recordFailure(host)
                     }
-                    recordPlaybackFailure(e, allowRefresh = true, refreshOnBizUnavailable = false)
+                    recordPlaybackFailure(e, allowRefresh = !isBackground, refreshOnBizUnavailable = false)
                 }
             }
         }
 
         // Tier 3: V5 POST preload/v1 fallback
         if (!v5ReturnedDataButUnusable) {
-            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, 2)) {
+            for (host in playbackHostSelector.orderedHosts(LegacySigner.PRELOAD_PLAYBACK_HOSTS, tier3HostLimit)) {
                 val startMs = System.currentTimeMillis()
                 try {
                     val signed = LegacySigner.buildV5PlaybackRequest(
@@ -2048,7 +2076,7 @@ class HongguoApiClient(
                         apiPath = LegacySigner.PRELOAD_PLAYBACK_PATH,
                         currentAppProfile = true
                     )
-                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = 6_000L)
+                    val resp = executeSignedJson(signed, method = "POST", timeoutMs = reqTimeoutMs)
                     val result = resolvePlayResponse(resp, vid, preferredQuality)
                     playbackHostSelector.recordSuccess(host, (System.currentTimeMillis() - startMs).coerceAtLeast(1L))
                     return@withContext result
@@ -2061,8 +2089,8 @@ class HongguoApiClient(
             }
         }
 
-        // Tier 4: Bodyless V5 GET on video_tab fallback
-        if (!v5ReturnedDataButUnusable) {
+        // Tier 4: Bodyless V5 GET on video_tab fallback (foreground only to avoid background rate-limit storms)
+        if (!isBackground && !v5ReturnedDataButUnusable) {
             for (host in playbackHostSelector.orderedHosts(LegacySigner.VIDEO_TAB_HOSTS, 2)) {
                 val startMs = System.currentTimeMillis()
                 try {
@@ -2086,13 +2114,15 @@ class HongguoApiClient(
         }
 
         // Tier 5: Official Web Direct MP4 (rescues ByteVC2-only / App rate-limit / missing metadata)
-        val webVariant = runCatching { fetchPlayUrlFromWeb(vid, seriesId) }.getOrNull()
-        if (webVariant != null) {
-            return@withContext EpisodePlayResult(vid = vid, variants = listOf(webVariant))
+        if (!isBackground || v5ReturnedDataButUnusable) {
+            val webVariant = runCatching { fetchPlayUrlFromWeb(vid, seriesId) }.getOrNull()
+            if (webVariant != null) {
+                return@withContext EpisodePlayResult(vid = vid, variants = listOf(webVariant))
+            }
         }
 
-        // Tier 6: App Legacy API only if V5 suffered transport/empty failures (avoid masking real business/codec errors)
-        if (!v5ReturnedDataButUnusable) {
+        // Tier 6: App Legacy API only if V5 suffered transport/empty failures (foreground only)
+        if (!isBackground && !v5ReturnedDataButUnusable) {
             for (host in playbackHostSelector.orderedHosts(LegacySigner.PLAYBACK_HOSTS, 2)) {
                 val startMs = System.currentTimeMillis()
                 try {

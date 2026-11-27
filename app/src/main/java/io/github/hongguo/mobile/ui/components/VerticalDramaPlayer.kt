@@ -371,6 +371,9 @@ fun VerticalDramaPlayer(
 
     LaunchedEffect(isActive, isUserPaused, activeSource) {
         if (activeSource != null) {
+            if (isActive && !isUserPaused && playerError == null && exoPlayer.playbackState == Player.STATE_IDLE) {
+                exoPlayer.prepare()
+            }
             exoPlayer.playWhenReady = isActive && !isUserPaused
         }
         if (!isActive) {

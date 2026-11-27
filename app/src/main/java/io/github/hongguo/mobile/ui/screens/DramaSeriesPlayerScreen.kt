@@ -210,9 +210,10 @@ fun DramaSeriesPlayerScreen(
     val pagerState = rememberPagerState(initialPage = startPage, pageCount = { loadedDetail.episodes.size })
     val episodeStates = remember(loadedDetail.seriesId) { mutableStateMapOf<String, EpisodeLoadState>() }
     val autoRecoveredVids = remember(loadedDetail.seriesId) { mutableStateMapOf<String, Int>() }
+    val episodeRetryTicks = remember(loadedDetail.seriesId) { mutableStateMapOf<String, Int>() }
+    val consumedRetryBypassTicks = remember(loadedDetail.seriesId) { mutableMapOf<String, Int>() }
     val livePositions = remember(loadedDetail.seriesId) { mutableStateMapOf<Int, Long>() }
     var qualityResumePos by remember(loadedDetail.seriesId) { mutableStateOf<Pair<Int, Long>?>(null) }
-    var mediaRetryTick by remember { mutableIntStateOf(0) }
     var replayTrigger by remember(loadedDetail.seriesId) { mutableIntStateOf(0) }
     var showSeriesEndedCard by remember(loadedDetail.seriesId) { mutableStateOf(false) }
     var showAutoResumeBanner by remember(loadedDetail.seriesId, autoResumed) { mutableStateOf(autoResumed) }
@@ -397,7 +398,9 @@ fun DramaSeriesPlayerScreen(
     }
 
     // Resolve current episode & preload next 1-2 episodes
-    LaunchedEffect(pagerState.currentPage, loadedDetail, effectiveQuality, mediaRetryTick) {
+    val curEpVidForLoad = loadedDetail.episodes.getOrNull(pagerState.currentPage)?.vid
+    val curEpRetryTick = curEpVidForLoad?.let { episodeRetryTicks[it] } ?: 0
+    LaunchedEffect(curEpVidForLoad, loadedDetail, effectiveQuality, curEpRetryTick) {
         showSeriesEndedCard = false
         if (pagerState.currentPage >= (loadedDetail.episodes.size - 2).coerceAtLeast(0) &&
             relatedBundle == null &&
@@ -436,23 +439,37 @@ fun DramaSeriesPlayerScreen(
             )
         }
         val curState = episodeStates[ep.vid]
+        val bypassForRetry = shouldBypassCacheForRetry(ep.vid, curEpRetryTick, consumedRetryBypassTicks)
+        if (bypassForRetry) {
+            consumedRetryBypassTicks[ep.vid] = curEpRetryTick
+        }
         if (curState?.media == null && curState?.loading != true) {
-            val quickPeek = if (mediaRetryTick == 0) container.mediaCache.peekResolvedSource(ep.vid, effectiveQuality) else null
+            val quickPeek = if (!bypassForRetry) container.mediaCache.peekResolvedSource(ep.vid, effectiveQuality) else null
             if (quickPeek != null) {
                 episodeStates[ep.vid] = EpisodeLoadState(media = quickPeek, loading = false)
             } else {
+                var markedLoading = true
                 episodeStates[ep.vid] = EpisodeLoadState(loading = true)
                 try {
                     val resolved = container.mediaCache.resolvePlayableSource(
                         vid = ep.vid,
                         quality = effectiveQuality,
                         seriesId = loadedDetail.seriesId,
-                        bypassCooldown = mediaRetryTick > 0
+                        bypassCooldown = bypassForRetry
                     )
+                    markedLoading = false
                     episodeStates[ep.vid] = EpisodeLoadState(media = resolved, loading = false)
                 } catch (ce: CancellationException) {
+                    if (markedLoading) {
+                        episodeStates[ep.vid]?.let { st ->
+                            if (st.loading && st.media == null) {
+                                episodeStates[ep.vid] = st.copy(loading = false)
+                            }
+                        }
+                    }
                     throw ce
                 } catch (e: Exception) {
+                    markedLoading = false
                     episodeStates[ep.vid] = EpisodeLoadState(
                         loading = false,
                         error = friendlyErrorMessage(e, "片源加载失败，请点击重试")
@@ -533,14 +550,14 @@ fun DramaSeriesPlayerScreen(
                             autoRecoveredVids[ep.vid] = count + 1
                             container.mediaCache.invalidateSource(ep.vid, effectiveQuality)
                             episodeStates.remove(ep.vid)
-                            mediaRetryTick++
+                            episodeRetryTicks[ep.vid] = (episodeRetryTicks[ep.vid] ?: 0) + 1
                         }
                     },
                     onRetry = {
                         autoRecoveredVids.remove(ep.vid)
                         container.mediaCache.invalidateSource(ep.vid, effectiveQuality)
                         episodeStates.remove(ep.vid)
-                        mediaRetryTick++
+                        episodeRetryTicks[ep.vid] = (episodeRetryTicks[ep.vid] ?: 0) + 1
                     },
                     onEnded = {
                         if (container.sleepTimer.consumeEpisodeEndTrigger()) return@VerticalDramaPlayer
@@ -638,7 +655,6 @@ fun DramaSeriesPlayerScreen(
                         qualityResumePos = pagerState.currentPage to savedPos
                         container.localStore.updateSettings { it.copy(quality = QualityPreference.P480.key) }
                         episodeStates.clear()
-                        mediaRetryTick++
                     },
                     showSeekBar = !effectiveCleanMode,
                     showFullscreenHint = !effectiveCleanMode,
@@ -1326,12 +1342,13 @@ fun DramaSeriesPlayerScreen(
             },
             onSelectSpeed = { spd -> container.localStore.updateSettings { it.copy(playbackSpeed = spd) } },
             onSelectQuality = { q ->
-                val curEp = loadedDetail.episodes.getOrNull(pagerState.currentPage)
-                val savedPos = curEp?.let { livePositions[it.index] } ?: 0L
-                qualityResumePos = pagerState.currentPage to savedPos
-                container.localStore.updateSettings { it.copy(quality = q.key) }
-                episodeStates.clear()
-                mediaRetryTick++
+                if (q.key != settings.quality) {
+                    val curEp = loadedDetail.episodes.getOrNull(pagerState.currentPage)
+                    val savedPos = curEp?.let { livePositions[it.index] } ?: 0L
+                    qualityResumePos = pagerState.currentPage to savedPos
+                    container.localStore.updateSettings { it.copy(quality = q.key) }
+                    episodeStates.clear()
+                }
             },
             onDismiss = { showSpeedSheet = false }
         )

@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package io.github.hongguo.mobile.core
 
+import io.github.hongguo.mobile.player.FailureCooldownTracker
 import io.github.hongguo.mobile.player.SleepTimerManager
 import io.github.hongguo.mobile.player.SleepTimerMode
 import io.github.hongguo.mobile.player.computeFeedLowWaterMark
+import io.github.hongguo.mobile.player.computeFullLocalAheadCount
 import io.github.hongguo.mobile.player.computeRollingPrecacheTargetCount
+import io.github.hongguo.mobile.player.isStreamHeadSufficient
 import io.github.hongguo.mobile.player.selectRollingPrecacheTargets
 import io.github.hongguo.mobile.ui.components.shouldShowFullscreenControls
+import io.github.hongguo.mobile.ui.screens.computeFeedRetryBackoffMs
+import io.github.hongguo.mobile.ui.screens.shouldBypassCacheForRetry
 import io.github.hongguo.mobile.ui.screens.shouldHoldFullSeriesControlsVisible
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -518,5 +530,124 @@ class StabilityAndUxTest {
 
         // After cooldown expires (> 30s), hostA recovers behind tested healthy hosts or in base order among untested
         assertEquals(listOf("hostC", "hostB", "hostA"), selector.orderedHosts(base, 3, nowMs = 35_000L))
+    }
+
+    @Test
+    fun failureCooldownTrackerExpiresAndClearsCleanly() {
+        val tracker = FailureCooldownTracker(defaultCooldownMs = 90_000L)
+        tracker.markFailed("s1", nowMs = 1_000L)
+        tracker.markFailed("s2", cooldownMs = 5_000L, nowMs = 1_000L)
+
+        assertTrue(tracker.isInCooldown("s1", nowMs = 50_000L))
+        assertTrue(tracker.isInCooldown("s2", nowMs = 5_500L))
+        assertEquals(setOf("s1", "s2"), tracker.activeFailedIds(nowMs = 5_500L))
+
+        assertFalse(tracker.isInCooldown("s2", nowMs = 6_000L))
+        assertEquals(setOf("s1"), tracker.activeFailedIds(nowMs = 6_000L))
+
+        tracker.clear("s1")
+        assertFalse(tracker.isInCooldown("s1", nowMs = 6_000L))
+        assertTrue(tracker.activeFailedIds(nowMs = 6_000L).isEmpty())
+
+        tracker.markFailed("s3", nowMs = 10_000L)
+        tracker.clearAll()
+        assertFalse(tracker.isInCooldown("s3", nowMs = 10_500L))
+    }
+
+    @Test
+    fun streamHeadSufficiencyAcceptsShortCompleteClipsAndRejectsPartialSmallClips() {
+        assertTrue(isStreamHeadSufficient(cachedBytes = 512L * 1024L, contentLength = -1L))
+        assertTrue(isStreamHeadSufficient(cachedBytes = 320L * 1024L, contentLength = 320L * 1024L))
+        assertFalse(isStreamHeadSufficient(cachedBytes = 320L * 1024L, contentLength = 2L * 1024L * 1024L))
+        assertFalse(isStreamHeadSufficient(cachedBytes = 320L * 1024L, contentLength = -1L))
+        assertFalse(isStreamHeadSufficient(cachedBytes = 4L * 1024L, contentLength = 4L * 1024L))
+    }
+
+    @Test
+    fun fullLocalAheadCountAndRetryPoliciesBehaveDeterministically() {
+        assertEquals(8, computeFullLocalAheadCount(isWifi = true, wifiOnlyPreload = true, preloadEnabled = true))
+        assertEquals(1, computeFullLocalAheadCount(isWifi = false, wifiOnlyPreload = false, preloadEnabled = true))
+        assertEquals(0, computeFullLocalAheadCount(isWifi = false, wifiOnlyPreload = true, preloadEnabled = true))
+        assertEquals(0, computeFullLocalAheadCount(isWifi = true, wifiOnlyPreload = false, preloadEnabled = false))
+
+        assertEquals(0L, computeFeedRetryBackoffMs(0))
+        assertEquals(2_000L, computeFeedRetryBackoffMs(1))
+        assertEquals(4_000L, computeFeedRetryBackoffMs(2))
+        assertEquals(8_000L, computeFeedRetryBackoffMs(3))
+        assertEquals(16_000L, computeFeedRetryBackoffMs(4))
+        assertEquals(30_000L, computeFeedRetryBackoffMs(5))
+        assertEquals(30_000L, computeFeedRetryBackoffMs(10))
+
+        val consumed = mutableMapOf<String, Int>()
+        assertFalse(shouldBypassCacheForRetry("s1", 0, consumed))
+        assertTrue(shouldBypassCacheForRetry("s1", 1, consumed))
+        consumed["s1"] = 1
+        assertFalse(shouldBypassCacheForRetry("s1", 1, consumed))
+        assertFalse(shouldBypassCacheForRetry("s2", 0, consumed))
+        assertTrue(shouldBypassCacheForRetry("s1", 2, consumed))
+    }
+
+    @Test
+    fun recommendFeedFallbackSucceedsOnPage2WhenPrimaryFails() {
+        val dir = Files.createTempDirectory("feed_fallback_test").toFile()
+        try {
+            val identityFile = dir.resolve("device_identity.json")
+            identityFile.writeText(
+                """{"deviceId":"1234567890123","iid":"9876543210987","cdid":"cdid-fallback-test"}""",
+                StandardCharsets.UTF_8
+            )
+            val appRecOffsets = ArrayList<String>()
+            var mallPageCalls = 0
+            val mockClient = OkHttpClient.Builder()
+                .addInterceptor(Interceptor { chain ->
+                    val req = chain.request()
+                    val path = req.url.encodedPath
+                    val jsonBody = when {
+                        path.contains("get_mall_playlet_feed") -> {
+                            mallPageCalls++
+                            if (req.url.queryParameter("offset") == "0") {
+                                """{"code":0,"data":{"has_more":true,"next_offset":10,"session_id":"sess-mall-1","cell_view":{"cell_data":[{"video_data":[{"series_id":"100001","title":"剧集一","vid":"200001"}]}]}}}"""
+                            } else {
+                                return@Interceptor Response.Builder()
+                                    .request(req)
+                                    .protocol(Protocol.HTTP_1_1)
+                                    .code(500)
+                                    .message("Server Error")
+                                    .body("{}".toResponseBody("application/json".toMediaType()))
+                                    .build()
+                            }
+                        }
+                        path.contains("bookmall/cell/change/v1") -> {
+                            appRecOffsets.add(req.url.queryParameter("offset").orEmpty())
+                            """{"code":0,"data":{"has_more":true,"next_offset":12,"session_id":"sess-rec-1","cell_view":{"cell_data":[{"video_data":[{"series_id":"100002","title":"剧集二","vid":"200002"}]}]}}}"""
+                        }
+                        else -> """{"code":0,"data":{}}"""
+                    }
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(jsonBody.toResponseBody("application/json".toMediaType()))
+                        .build()
+                })
+                .build()
+
+            val apiClient = HongguoApiClient(mockClient, deviceIdentityFile = identityFile)
+            runBlocking {
+                val page1 = apiClient.fetchRecommendFeed("hot-drama", page = 1, forceRefresh = true)
+                assertEquals(1, page1.page)
+                assertEquals(listOf("100001"), page1.items.map { it.seriesId })
+                assertTrue(page1.hasMore)
+
+                val page2 = apiClient.fetchRecommendFeed("hot-drama", page = 2, forceRefresh = false)
+                assertEquals(2, page2.page)
+                assertEquals(listOf("100002"), page2.items.map { it.seriesId })
+                assertEquals(listOf("0"), appRecOffsets)
+            }
+            assertTrue(mallPageCalls >= 2)
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 }

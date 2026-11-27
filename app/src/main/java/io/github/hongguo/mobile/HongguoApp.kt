@@ -13,12 +13,19 @@ import io.github.hongguo.mobile.player.MediaCacheManager
 import io.github.hongguo.mobile.player.PlaybackControlBus
 import io.github.hongguo.mobile.player.SleepTimerManager
 import kotlinx.coroutines.flow.MutableStateFlow
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.TimeUnit
 
 class AppContainer(app: Application) {
     val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .dispatcher(
+            Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 12
+            }
+        )
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)

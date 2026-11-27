@@ -32,10 +32,10 @@ class ExoPlayerPool(private val maxPoolSize: Int = 3) {
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                15_000,
-                35_000,
-                600,
-                1_200
+                8_000,
+                20_000,
+                500,
+                1_000
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
